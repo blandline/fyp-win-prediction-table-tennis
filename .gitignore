@@ -1,0 +1,31 @@
+# Model weights
+*.pt
+*.pth
+*.h5
+*.ckpt
+*.onnx
+*.bin
+
+# Large model directories
+weights/
+models/
+checkpoints/
+runs/
+
+# Datasets
+data/
+dataset/
+segmentation_data/
+scoreboard_yolo/
+scoreboard_clean/
+sort/
+numbers.v1i.yolov8/
+digits-detect.v1i.yolov8/
+tracking_output/
+yolo_dataset/
+runs/
+# Python junk
+__pycache__/
+*.pyc
+.env
+.venv
