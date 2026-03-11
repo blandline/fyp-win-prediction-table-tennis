@@ -5,6 +5,16 @@
 *.ckpt
 *.onnx
 *.bin
+*.mp4
+*.jpg
+*.png
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.ico
+*.svg
 
 # Large model directories
 weights/
