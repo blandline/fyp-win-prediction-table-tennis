@@ -45,6 +45,108 @@ TRACKER_IOU_THRESHOLD = 0.1  # IOU threshold for matching (lower for fast ball)
 TRAJECTORY_LENGTH = 50  # Number of points to show in trajectory
 SPEED_SMOOTHING_WINDOW = 5  # Frames to average speed over
 
+# ITTF table dimensions (meters)
+TABLE_LENGTH_M = 2.74
+TABLE_WIDTH_M = 1.525
+
+# Physical limits for filtering
+TABLE_MARGIN_M = 1.5  # accept ball positions up to this far outside the table
+MAX_BALL_SPEED_MPS = 40.0  # world-record smash is ~32 m/s; generous cap
+
+# =============================================================================
+# TABLE CALIBRATION (HOMOGRAPHY FOR PIXEL -> METERS)
+# =============================================================================
+class TableCalibration:
+    """
+    Maps pixel coordinates to table-plane coordinates in meters using homography.
+    Expects 4 corners in order: top-left, top-right, bottom-right, bottom-left.
+    """
+    # Real-world table corners (meters): TL, TR, BR, BL
+    DST_CORNERS = np.array([
+        [0, 0],
+        [TABLE_LENGTH_M, 0],
+        [TABLE_LENGTH_M, TABLE_WIDTH_M],
+        [0, TABLE_WIDTH_M]
+    ], dtype=np.float32)
+
+    def __init__(self, pixel_corners):
+        """
+        pixel_corners: list of 4 (x, y) in pixel coords, order TL, TR, BR, BL.
+        """
+        self.pixel_corners = np.array(pixel_corners, dtype=np.float32).reshape(4, 2)
+        self.H, self._valid = self._compute_homography()
+        self._reprojection_error = None
+        if self._valid:
+            self._reprojection_error = self._check_reprojection_error()
+
+    def _compute_homography(self):
+        """Compute homography from pixel plane to table plane (meters)."""
+        if len(self.pixel_corners) != 4:
+            return None, False
+        try:
+            H, status = cv2.findHomography(
+                self.pixel_corners, self.DST_CORNERS,
+                method=cv2.RANSAC, ransacReprojThreshold=5.0
+            )
+            if H is None or status is None:
+                return None, False
+            return H, True
+        except Exception:
+            return None, False
+
+    def _check_reprojection_error(self):
+        """Reproject pixel corners to meter plane and return mean error in meters."""
+        if self.H is None:
+            return float('inf')
+        src = self.pixel_corners.reshape(-1, 1, 2).astype(np.float32)
+        dst_reproj = cv2.perspectiveTransform(src, self.H)
+        dst_reproj = dst_reproj.reshape(4, 2)
+        real = self.DST_CORNERS
+        return float(np.mean(np.linalg.norm(dst_reproj - real, axis=1)))
+
+    def is_valid(self):
+        """True if homography was computed and sanity checks pass."""
+        if not self._valid or self.H is None:
+            return False
+        # Reprojection error should be small (in meters)
+        if self._reprojection_error is not None and self._reprojection_error > 0.15:
+            return False
+        # Check aspect ratio of mapped table (from transformed corners)
+        pts = np.array([[0, 0], [TABLE_LENGTH_M, 0], [TABLE_LENGTH_M, TABLE_WIDTH_M], [0, TABLE_WIDTH_M]], dtype=np.float32)
+        # Map back to pixel and compute side lengths in pixels to check for degenerate
+        p = self.pixel_corners
+        w1 = np.linalg.norm(p[1] - p[0])
+        w2 = np.linalg.norm(p[2] - p[3])
+        h1 = np.linalg.norm(p[3] - p[0])
+        h2 = np.linalg.norm(p[2] - p[1])
+        if w1 < 10 or w2 < 10 or h1 < 10 or h2 < 10:
+            return False
+        return True
+
+    def pixel_to_meters(self, u, v):
+        """
+        Transform a single point (u, v) in pixel coords to (x_m, y_m) on table plane.
+        Returns (None, None) if the projected point is unreasonably far from the table,
+        which happens when the ball is airborne (above the table plane) and the
+        homography extrapolates to a divergent position.
+        """
+        if not self._valid or self.H is None:
+            return None, None
+        pt = np.array([[[float(u), float(v)]]], dtype=np.float32)
+        out = cv2.perspectiveTransform(pt, self.H)
+        x_m, y_m = float(out[0, 0, 0]), float(out[0, 0, 1])
+        # Reject positions that are too far from the table surface.
+        # The ball is often airborne, and the 2D homography projects such
+        # points to wildly wrong locations on the table plane.
+        if (x_m < -TABLE_MARGIN_M or x_m > TABLE_LENGTH_M + TABLE_MARGIN_M or
+                y_m < -TABLE_MARGIN_M or y_m > TABLE_WIDTH_M + TABLE_MARGIN_M):
+            return None, None
+        return x_m, y_m
+
+    def get_reprojection_error(self):
+        """Mean reprojection error in meters (for logging)."""
+        return self._reprojection_error
+
 # =============================================================================
 # GLOBAL STATE FOR INTERACTIVE MARKING
 # =============================================================================
@@ -67,7 +169,9 @@ class MarkingState:
             'player1_rounds': None,
             'player2_rounds': None
         }
-        
+        # Table corners for homography: 4 points (TL, TR, BR, BL) in original frame coords
+        self.table_corners = []
+
         self.done = False
         self.original_frame = None
         self.display_frame = None
@@ -171,50 +275,77 @@ def draw_rois_on_frame(frame, rois, zoom_factor, pan_offset, frame_shape):
                        (sx1, sy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
+def draw_table_corners_on_frame(frame, table_corners, zoom_factor, pan_offset, frame_shape):
+    """Draw table corner points and polygon on the display frame (zoomed coords)."""
+    if not table_corners:
+        return
+    h, w = frame_shape[:2]
+    new_w = int(w / zoom_factor)
+    new_h = int(h / zoom_factor)
+    cx = w // 2 + pan_offset[0]
+    cy = h // 2 + pan_offset[1]
+    x1_off = max(0, cx - new_w // 2)
+    y1_off = max(0, cy - new_h // 2)
+    pts = []
+    for (ox, oy) in table_corners:
+        sx = int((ox - x1_off) * zoom_factor)
+        sy = int((oy - y1_off) * zoom_factor)
+        pts.append((sx, sy))
+        cv2.circle(frame, (sx, sy), 8, (0, 255, 255), 2)
+    if len(pts) >= 2:
+        for i in range(len(pts)):
+            p1, p2 = pts[i], pts[(i + 1) % len(pts)]
+            cv2.line(frame, p1, p2, (0, 255, 255), 2)
+    if len(pts) == 4:
+        cv2.putText(frame, "Table", (pts[0][0], pts[0][1] - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+
 def draw_instructions(frame, marking_mode, current_roi):
     """Draw instruction overlay."""
     h, w = frame.shape[:2]
     
-    # Semi-transparent overlay for instructions
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (10, 10), (450, 200), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-    
-    # Instructions
+    # Instructions (wider box for table line)
     instructions = [
         "CONTROLS:",
         "  Mouse Wheel: Zoom in/out",
         "  Right-click drag: Pan",
-        "  Left-click: Draw ROI corners",
+        "  Left-click: Draw ROI corners (or table corners for 5)",
         "",
         "KEYS:",
         "  1: Mark Player 1 Score Area",
         "  2: Mark Player 2 Score Area",
         "  3: Mark Player 1 Rounds Area",
         "  4: Mark Player 2 Rounds Area",
+        "  5: Mark Table (4 corners: TL, TR, BR, BL)",
         "  R: Reset all markings",
         "  ENTER: Confirm and start tracking",
         "  ESC: Cancel"
     ]
-    
+    overlay_w = 480
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (10, 10), (overlay_w, 230), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
     y = 30
     for line in instructions:
         cv2.putText(frame, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         y += 15
-    
+
     # Current mode indicator
     if marking_mode:
         mode_names = {
             'player1_score': 'MARKING: Player 1 Score',
             'player2_score': 'MARKING: Player 2 Score',
             'player1_rounds': 'MARKING: Player 1 Rounds',
-            'player2_rounds': 'MARKING: Player 2 Rounds'
+            'player2_rounds': 'MARKING: Player 2 Rounds',
+            'table_corners': 'MARKING: Table (TL, TR, BR, BL)'
         }
         cv2.putText(frame, mode_names.get(marking_mode, ''), 
-                   (w - 300, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    
+                   (w - 320, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
     # Draw current ROI in progress
-    if len(current_roi) == 1:
+    if marking_mode != 'table_corners' and len(current_roi) == 1:
         cv2.circle(frame, current_roi[0], 5, (0, 0, 255), -1)
         cv2.putText(frame, "Click second corner", (current_roi[0][0] + 10, current_roi[0][1]),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
@@ -255,29 +386,38 @@ def mouse_callback_setup(event, x, y, flags, param):
                 x, y, marking_state.zoom_factor, marking_state.pan_offset,
                 marking_state.original_frame.shape
             )
-            
-            marking_state.current_roi.append((x, y))  # Store screen coords for display
-            
-            if len(marking_state.current_roi) == 2:
-                # Complete ROI
-                p1 = screen_to_original_coords(
-                    marking_state.current_roi[0][0], marking_state.current_roi[0][1],
-                    marking_state.zoom_factor, marking_state.pan_offset,
-                    marking_state.original_frame.shape
-                )
-                p2 = screen_to_original_coords(
-                    marking_state.current_roi[1][0], marking_state.current_roi[1][1],
-                    marking_state.zoom_factor, marking_state.pan_offset,
-                    marking_state.original_frame.shape
-                )
-                
-                x1, y1 = min(p1[0], p2[0]), min(p1[1], p2[1])
-                x2, y2 = max(p1[0], p2[0]), max(p1[1], p2[1])
-                
-                marking_state.rois[marking_state.marking_mode] = (x1, y1, x2, y2)
-                marking_state.current_roi = []
-                marking_state.marking_mode = None
-                print(f"ROI marked: ({x1}, {y1}) to ({x2}, {y2})")
+
+            if marking_state.marking_mode == 'table_corners':
+                marking_state.table_corners.append((orig_x, orig_y))
+                corner_names = ['TL', 'TR', 'BR', 'BL']
+                idx = len(marking_state.table_corners) - 1
+                print(f"Table corner {corner_names[idx]}: ({orig_x}, {orig_y})")
+                if len(marking_state.table_corners) >= 4:
+                    marking_state.marking_mode = None
+                    print("Table corners complete.")
+            else:
+                marking_state.current_roi.append((x, y))  # Store screen coords for display
+
+                if len(marking_state.current_roi) == 2:
+                    # Complete ROI
+                    p1 = screen_to_original_coords(
+                        marking_state.current_roi[0][0], marking_state.current_roi[0][1],
+                        marking_state.zoom_factor, marking_state.pan_offset,
+                        marking_state.original_frame.shape
+                    )
+                    p2 = screen_to_original_coords(
+                        marking_state.current_roi[1][0], marking_state.current_roi[1][1],
+                        marking_state.zoom_factor, marking_state.pan_offset,
+                        marking_state.original_frame.shape
+                    )
+
+                    x1, y1 = min(p1[0], p2[0]), min(p1[1], p2[1])
+                    x2, y2 = max(p1[0], p2[0]), max(p1[1], p2[1])
+
+                    marking_state.rois[marking_state.marking_mode] = (x1, y1, x2, y2)
+                    marking_state.current_roi = []
+                    marking_state.marking_mode = None
+                    print(f"ROI marked: ({x1}, {y1}) to ({x2}, {y2})")
 
 
 def interactive_frame_setup(frame):
@@ -315,6 +455,12 @@ def interactive_frame_setup(frame):
             marking_state.zoom_factor, marking_state.pan_offset,
             marking_state.original_frame.shape
         )
+        # Draw table corners
+        draw_table_corners_on_frame(
+            display, marking_state.table_corners,
+            marking_state.zoom_factor, marking_state.pan_offset,
+            marking_state.original_frame.shape
+        )
         
         # Draw current ROI in progress
         if len(marking_state.current_roi) == 1:
@@ -348,21 +494,27 @@ def interactive_frame_setup(frame):
             marking_state.marking_mode = 'player2_rounds'
             marking_state.current_roi = []
             print("Mode: Marking Player 2 Rounds Area")
+        elif key == ord('5'):
+            marking_state.marking_mode = 'table_corners'
+            marking_state.table_corners = []
+            marking_state.current_roi = []
+            print("Mode: Mark Table. Click 4 corners in order: TL, TR, BR, BL")
         elif key == ord('r'):
             marking_state.rois = {k: None for k in marking_state.rois}
+            marking_state.table_corners = []
             marking_state.current_roi = []
             marking_state.marking_mode = None
             print("All markings reset")
     
     cv2.destroyWindow(window_name)
-    return marking_state.rois
+    return marking_state.rois, marking_state.table_corners
 
 
 # =============================================================================
 # BALL TRACKING AND SPEED CALCULATION
 # =============================================================================
 class BallTracker:
-    def __init__(self, model_path, fps):
+    def __init__(self, model_path, fps, table_calibration=None):
         self.model = YOLO(model_path)
         self.tracker = Sort(
             max_age=TRACKER_MAX_AGE,
@@ -370,15 +522,14 @@ class BallTracker:
             iou_threshold=TRACKER_IOU_THRESHOLD
         )
         self.fps = fps
+        self.table_calibration = table_calibration  # TableCalibration or None
         
-        # Trajectory history per track ID
+        # Trajectory history per track ID (pixel coords)
         self.trajectories = {}
         self.speed_history = {}
-        
-        # Pixel to meter conversion (approximate for table tennis)
-        # Table tennis table is 2.74m x 1.525m
-        # This should be calibrated for your camera setup
-        self.pixels_per_meter = None  # Will be estimated or set manually
+        # Meter-space trajectory and speed when calibration is set
+        self.trajectories_meters = {}
+        self.speed_history_mps = {}
     
     def detect_and_track(self, frame):
         """Detect ball and update tracking."""
@@ -401,6 +552,7 @@ class BallTracker:
         tracks = self.tracker.update(dets)
         
         # Update trajectories
+        dt_sec = 1.0 / self.fps if self.fps > 0 else 1.0
         for track in tracks:
             x1, y1, x2, y2, track_id = track
             track_id = int(track_id)
@@ -411,25 +563,50 @@ class BallTracker:
             if track_id not in self.trajectories:
                 self.trajectories[track_id] = deque(maxlen=TRAJECTORY_LENGTH)
                 self.speed_history[track_id] = deque(maxlen=SPEED_SMOOTHING_WINDOW)
+                self.trajectories_meters[track_id] = deque(maxlen=TRAJECTORY_LENGTH)
+                self.speed_history_mps[track_id] = deque(maxlen=SPEED_SMOOTHING_WINDOW)
             
             self.trajectories[track_id].append((cx, cy))
             
-            # Calculate speed
+            # Calculate speed (pixels per second)
             if len(self.trajectories[track_id]) >= 2:
                 prev_x, prev_y = self.trajectories[track_id][-2]
                 dist_pixels = np.sqrt((cx - prev_x)**2 + (cy - prev_y)**2)
-                
-                # Speed in pixels per second
                 speed_pps = dist_pixels * self.fps
                 self.speed_history[track_id].append(speed_pps)
+            
+            # Meter-space position and speed when calibration is available
+            if self.table_calibration and self.table_calibration.is_valid():
+                x_m, y_m = self.table_calibration.pixel_to_meters(cx, cy)
+                if x_m is not None:
+                    self.trajectories_meters[track_id].append((x_m, y_m))
+                    if len(self.trajectories_meters[track_id]) >= 2:
+                        px, py = self.trajectories_meters[track_id][-2]
+                        dist_m = np.sqrt((x_m - px)**2 + (y_m - py)**2)
+                        speed_mps = dist_m / dt_sec
+                        if speed_mps <= MAX_BALL_SPEED_MPS:
+                            self.speed_history_mps[track_id].append(speed_mps)
         
         return tracks
     
     def get_smoothed_speed(self, track_id):
-        """Get smoothed speed for a track."""
+        """Get smoothed speed for a track (pixels per second)."""
         if track_id in self.speed_history and self.speed_history[track_id]:
             return np.mean(self.speed_history[track_id])
         return 0
+    
+    def get_smoothed_speed_mps(self, track_id):
+        """Get smoothed speed in m/s (median for outlier robustness)."""
+        if track_id in self.speed_history_mps and self.speed_history_mps[track_id]:
+            return float(np.median(self.speed_history_mps[track_id]))
+        return None
+    
+    def get_position_meters(self, track_id):
+        """Get latest ball position in table-plane meters (x_m, y_m) or (None, None)."""
+        if not self.table_calibration or track_id not in self.trajectories_meters or not self.trajectories_meters[track_id]:
+            return None, None
+        x_m, y_m = self.trajectories_meters[track_id][-1]
+        return x_m, y_m
     
     def draw_trajectories(self, frame, tracks):
         """Draw ball trajectories and speed on frame."""
@@ -455,9 +632,13 @@ class BallTracker:
                     pt2 = (int(points[i][0]), int(points[i][1]))
                     cv2.line(frame, pt1, pt2, color, thickness)
             
-            # Draw speed
-            speed = self.get_smoothed_speed(track_id)
-            speed_text = f"{speed:.0f} px/s"
+            # Draw speed (m/s when table calibration is valid, else px/s)
+            speed_mps = self.get_smoothed_speed_mps(track_id)
+            if speed_mps is not None:
+                speed_text = f"{speed_mps:.2f} m/s"
+            else:
+                speed = self.get_smoothed_speed(track_id)
+                speed_text = f"{speed:.0f} px/s"
             cv2.putText(frame, speed_text, (cx + 10, cy - 10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             
@@ -674,31 +855,176 @@ class ScoreDetector:
 
 
 # =============================================================================
+# RALLY AGGREGATION (SCORE-CHANGE TO SCORE-CHANGE)
+# =============================================================================
+class RallyAggregator:
+    """
+    Aggregates ball trajectory in meter space per rally (score change to score change).
+    Outputs one row per rally for the prediction module.
+    """
+    def __init__(self, fps, data_logger, table_calibration=None):
+        self.fps = fps
+        self.logger = data_logger
+        self.table_calibration = table_calibration
+        self.rally_id = 0
+        self.rally_start_frame = 0
+        self.rally_start_time = 0.0
+        self.rally_start_scores = (None, None)  # score at start of current rally
+        self.rally_start_sets = (None, None)
+        self.samples = []  # list of (frame_idx, x_m, y_m, speed_mps)
+        self.last_scores = (None, None)  # (p1, p2) previous frame
+        self.last_sets = (None, None)
+    
+    def _table_contains(self, x_m, y_m):
+        """True if (x_m, y_m) is inside table plane (with small margin)."""
+        if x_m is None or y_m is None:
+            return False
+        margin = 0.1
+        return (-margin <= x_m <= TABLE_LENGTH_M + margin and
+                -margin <= y_m <= TABLE_WIDTH_M + margin)
+    
+    def _landing_zone_index(self, x_m, y_m):
+        """3x3 grid over table. Returns 0-8 or None if outside."""
+        if not self._table_contains(x_m, y_m):
+            return None
+        x = max(0, min(TABLE_LENGTH_M, x_m))
+        y = max(0, min(TABLE_WIDTH_M, y_m))
+        col = min(2, int(x / (TABLE_LENGTH_M / 3)))
+        row = min(2, int(y / (TABLE_WIDTH_M / 3)))
+        return row * 3 + col
+    
+    def add_frame(self, frame_idx, timestamp_sec, tracks_with_meters, scores, rounds):
+        """
+        Call each frame. tracks_with_meters: list of (track_id, x_m, y_m, speed_mps).
+        When score changes, flush current rally and start next.
+        """
+        p1, p2 = scores.get('player1'), scores.get('player2')
+        r1, r2 = rounds.get('player1', 0), rounds.get('player2', 0)
+        current_scores = (p1, p2)
+        current_sets = (r1, r2)
+        
+        # First time we have scores: set rally start
+        if self.rally_start_scores[0] is None and p1 is not None and p2 is not None:
+            self.rally_start_scores = current_scores
+            self.rally_start_sets = current_sets
+        
+        # Detect score change (point ended)
+        if self.last_scores[0] is not None and self.last_scores[1] is not None:
+            if (p1, p2) != self.last_scores:
+                # Flush previous rally: winner = whoever's score increased
+                if p1 != self.last_scores[0] and p2 == self.last_scores[1]:
+                    point_winner = 'p1'
+                elif p2 != self.last_scores[1] and p1 == self.last_scores[0]:
+                    point_winner = 'p2'
+                else:
+                    point_winner = 'unknown'
+                self._flush_rally(frame_idx, timestamp_sec, point_winner)
+                self.rally_id += 1
+                self.rally_start_frame = frame_idx
+                self.rally_start_time = timestamp_sec
+                self.rally_start_scores = current_scores
+                self.rally_start_sets = current_sets
+                self.samples = []
+        
+        self.last_scores = current_scores
+        self.last_sets = current_sets
+        
+        # Accumulate samples for current rally (only if we have meter-space data)
+        if self.table_calibration and self.table_calibration.is_valid() and tracks_with_meters:
+            for (track_id, x_m, y_m, speed_mps) in tracks_with_meters:
+                if x_m is not None and y_m is not None:
+                    self.samples.append((frame_idx, x_m, y_m, speed_mps or 0.0))
+    
+    def _flush_rally(self, end_frame, end_time, point_winner):
+        """Write one rally row and reset buffer."""
+        record = {
+            'rally_id': self.rally_id,
+            'rally_start_frame': self.rally_start_frame,
+            'rally_end_frame': end_frame,
+            'rally_start_time': self.rally_start_time,
+            'rally_end_time': end_time,
+            'p1_score_start': self.rally_start_scores[0] if self.rally_start_scores[0] is not None else '',
+            'p2_score_start': self.rally_start_scores[1] if self.rally_start_scores[1] is not None else '',
+            'p1_sets_start': self.rally_start_sets[0] if self.rally_start_sets[0] is not None else '',
+            'p2_sets_start': self.rally_start_sets[1] if self.rally_start_sets[1] is not None else '',
+            'point_winner': point_winner
+        }
+        if not self.samples:
+            record['mean_speed_mps'] = ''
+            record['max_speed_mps'] = ''
+            record['speed_std_mps'] = ''
+            for i in range(9):
+                record[f'landing_zone_{i}'] = 0
+        else:
+            speeds = [s[3] for s in self.samples if s[3] is not None and s[3] > 0]
+            record['mean_speed_mps'] = f"{np.mean(speeds):.4f}" if speeds else ''
+            record['max_speed_mps'] = f"{max(speeds):.4f}" if speeds else ''
+            record['speed_std_mps'] = f"{np.std(speeds):.4f}" if len(speeds) > 1 else ''
+            # Landing zone histogram (3x3)
+            zones = [0] * 9
+            for _, x_m, y_m, _ in self.samples:
+                idx = self._landing_zone_index(x_m, y_m)
+                if idx is not None:
+                    zones[idx] += 1
+            for i in range(9):
+                record[f'landing_zone_{i}'] = zones[i]
+        self.logger.log_rally(record)
+    
+    def flush_final(self, end_frame, end_time):
+        """Call at end of video to write the last rally if any."""
+        if self.samples or self.last_scores[0] is not None:
+            self._flush_rally(end_frame, end_time, 'unknown')
+
+
+# =============================================================================
 # DATA LOGGING
 # =============================================================================
 class DataLogger:
-    def __init__(self, output_dir):
+    def __init__(self, output_dir, with_meters=False):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+        self.with_meters = with_meters  # If True, trajectory CSV includes x_m, y_m, speed_mps
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Trajectory log
         self.trajectory_file = self.output_dir / f"trajectories_{timestamp}.csv"
+        header = "frame,track_id,x,y,speed_pps"
+        if with_meters:
+            header += ",x_m,y_m,speed_mps"
         with open(self.trajectory_file, 'w') as f:
-            f.write("frame,track_id,x,y,speed_pps\n")
+            f.write(header + "\n")
         
         # Score log
         self.score_file = self.output_dir / f"scores_{timestamp}.csv"
         with open(self.score_file, 'w') as f:
             f.write("frame,timestamp_sec,player1_score,player2_score,player1_sets,player2_sets\n")
         
+        # Rally log (Stage 1: ball + score + placement)
+        self.rally_file = self.output_dir / f"rallies_{timestamp}.csv"
+        self._write_rally_header()
+        
         # ROI config
         self.config_file = self.output_dir / f"config_{timestamp}.json"
     
-    def log_trajectory(self, frame_idx, track_id, x, y, speed):
+    def _write_rally_header(self):
+        with open(self.rally_file, 'w') as f:
+            f.write(
+                "rally_id,rally_start_frame,rally_end_frame,rally_start_time,rally_end_time,"
+                "p1_score_start,p2_score_start,p1_sets_start,p2_sets_start,"
+                "mean_speed_mps,max_speed_mps,speed_std_mps,"
+                "landing_zone_0,landing_zone_1,landing_zone_2,landing_zone_3,landing_zone_4,"
+                "landing_zone_5,landing_zone_6,landing_zone_7,landing_zone_8,"
+                "point_winner\n"
+            )
+    
+    def log_trajectory(self, frame_idx, track_id, x, y, speed, x_m=None, y_m=None, speed_mps=None):
+        line = f"{frame_idx},{track_id},{x:.2f},{y:.2f},{speed:.2f}"
+        if self.with_meters and x_m is not None and y_m is not None:
+            sm = f"{speed_mps:.4f}" if speed_mps is not None else ""
+            line += f",{x_m:.4f},{y_m:.4f},{sm}"
         with open(self.trajectory_file, 'a') as f:
-            f.write(f"{frame_idx},{track_id},{x:.2f},{y:.2f},{speed:.2f}\n")
+            f.write(line + "\n")
     
     def log_score(self, frame_idx, timestamp, scores, rounds):
         with open(self.score_file, 'a') as f:
@@ -706,7 +1032,29 @@ class DataLogger:
             p2 = scores['player2'] if scores['player2'] is not None else ''
             f.write(f"{frame_idx},{timestamp:.2f},{p1},{p2},{rounds['player1']},{rounds['player2']}\n")
     
-    def save_config(self, rois, video_path, fps):
+    def log_rally(self, record):
+        """Append one rally feature row (dict with keys matching CSV header)."""
+        with open(self.rally_file, 'a') as f:
+            parts = [
+                record.get('rally_id', ''),
+                record.get('rally_start_frame', ''),
+                record.get('rally_end_frame', ''),
+                record.get('rally_start_time', ''),
+                record.get('rally_end_time', ''),
+                record.get('p1_score_start', ''),
+                record.get('p2_score_start', ''),
+                record.get('p1_sets_start', ''),
+                record.get('p2_sets_start', ''),
+                record.get('mean_speed_mps', ''),
+                record.get('max_speed_mps', ''),
+                record.get('speed_std_mps', ''),
+            ]
+            for i in range(9):
+                parts.append(record.get(f'landing_zone_{i}', 0))
+            parts.append(record.get('point_winner', ''))
+            f.write(','.join(str(p) for p in parts) + "\n")
+    
+    def save_config(self, rois, video_path, fps, table_corners=None):
         config = {
             'video_path': str(video_path),
             'fps': fps,
@@ -714,6 +1062,8 @@ class DataLogger:
             'ball_model': BALL_MODEL_PATH,
             'digit_model': DIGIT_MODEL_PATH
         }
+        if table_corners is not None and len(table_corners) == 4:
+            config['table_corners'] = [[float(p[0]), float(p[1])] for p in table_corners]
         with open(self.config_file, 'w') as f:
             json.dump(config, f, indent=2)
 
@@ -731,6 +1081,8 @@ class RealtimeStats:
         self.ball_detected = False
         self.current_speed = 0
         self.max_speed = 0
+        self.current_speed_mps = None  # m/s when table calibration is used
+        self.max_speed_mps = None
     
     def update(self):
         import time
@@ -741,11 +1093,14 @@ class RealtimeStats:
                 self.current_fps = 1.0 / np.mean(self.frame_times)
         self.last_time = current
     
-    def update_ball_stats(self, detected, speed):
+    def update_ball_stats(self, detected, speed, speed_mps=None):
         self.ball_detected = detected
         if detected and speed > 0:
             self.current_speed = speed
             self.max_speed = max(self.max_speed, speed)
+        if speed_mps is not None and speed_mps > 0:
+            self.current_speed_mps = speed_mps
+            self.max_speed_mps = max(self.max_speed_mps or 0, speed_mps)
     
     def draw(self, frame, frame_idx, total_frames, paused, playback_speed):
         h, w = frame.shape[:2]
@@ -777,15 +1132,22 @@ class RealtimeStats:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, ball_color, 1)
         y += line_height
         
-        # Speed
-        cv2.putText(frame, f"Speed: {self.current_speed:.0f} px/s", (20, y), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-        y += line_height
-        
-        # Max speed
-        cv2.putText(frame, f"Max Speed: {self.max_speed:.0f} px/s", (20, y), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
-        y += line_height
+        # Speed (m/s when table calibrated, else px/s)
+        if self.max_speed_mps is not None and self.max_speed_mps > 0:
+            cur = f"{self.current_speed_mps:.2f}" if self.current_speed_mps is not None else "0.00"
+            cv2.putText(frame, f"Speed: {cur} m/s", (20, y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+            y += line_height
+            cv2.putText(frame, f"Max Speed: {self.max_speed_mps:.2f} m/s", (20, y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
+            y += line_height
+        else:
+            cv2.putText(frame, f"Speed: {self.current_speed:.0f} px/s", (20, y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+            y += line_height
+            cv2.putText(frame, f"Max Speed: {self.max_speed:.0f} px/s", (20, y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
+            y += line_height
         
         # Progress
         progress = frame_idx / total_frames if total_frames > 0 else 0
@@ -845,28 +1207,43 @@ def main(video_path, output_dir="tracking_output", save_video=True):
     
     # Interactive setup
     print("\nStarting interactive setup...")
-    rois = interactive_frame_setup(first_frame)
-    
-    if rois is None:
+    result = interactive_frame_setup(first_frame)
+    if result is None:
         print("Setup cancelled.")
         return
+    rois, table_corners = result
     
     print("\nROIs configured:")
     for name, roi in rois.items():
         print(f"  {name}: {roi}")
+    if len(table_corners) == 4:
+        print("  Table corners: 4 points set (homography enabled)")
+    else:
+        print("  Table corners: not set (ball speed in px/s only)")
+    
+    # Table calibration (optional)
+    table_calibration = None
+    if len(table_corners) == 4:
+        table_calibration = TableCalibration(table_corners)
+        if table_calibration.is_valid():
+            print(f"  Table calibration OK (reprojection error ~{table_calibration.get_reprojection_error():.4f} m)")
+        else:
+            print("  Table calibration failed sanity checks; continuing without meter-space features.")
+            table_calibration = None
     
     # Initialize components
     print("\nLoading models...")
     print("  - Loading ball detection model...")
-    ball_tracker = BallTracker(BALL_MODEL_PATH, fps)
+    ball_tracker = BallTracker(BALL_MODEL_PATH, fps, table_calibration=table_calibration)
     print("  - Loading digit detection model...")
     score_detector = ScoreDetector(DIGIT_MODEL_PATH)
-    logger = DataLogger(output_dir)
+    logger = DataLogger(output_dir, with_meters=(table_calibration is not None and table_calibration.is_valid()))
+    rally_aggregator = RallyAggregator(fps, logger, table_calibration)
     stats = RealtimeStats(fps)
     print("  - Models loaded!")
     
     # Save configuration
-    logger.save_config(rois, video_path, fps)
+    logger.save_config(rois, video_path, fps, table_corners=table_corners)
     
     # Reset video to beginning
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -916,8 +1293,9 @@ def main(video_path, output_dir="tracking_output", save_video=True):
         if not paused:
             ret, frame = cap.read()
             if not ret:
-                # End of video - loop or stop
+                # End of video - flush last rally and stop
                 print("\nEnd of video reached.")
+                rally_aggregator.flush_final(frame_idx, frame_idx / fps if fps > 0 else 0)
                 break
             
             # Ball detection and tracking
@@ -927,19 +1305,23 @@ def main(video_path, output_dir="tracking_output", save_video=True):
             ball_detected = len(tracks) > 0
             max_speed = 0
             
-            # Log trajectories
+            # Log trajectories (with optional meter-space columns)
+            tracks_with_meters = []
+            max_speed_mps = None
             for track in tracks:
                 x1, y1, x2, y2, track_id = track
                 track_id = int(track_id)
                 cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
                 speed = ball_tracker.get_smoothed_speed(track_id)
                 max_speed = max(max_speed, speed)
-                logger.log_trajectory(frame_idx, track_id, cx, cy, speed)
+                x_m, y_m = ball_tracker.get_position_meters(track_id)
+                speed_mps = ball_tracker.get_smoothed_speed_mps(track_id)
+                if speed_mps is not None:
+                    max_speed_mps = max(max_speed_mps or 0, speed_mps)
+                logger.log_trajectory(frame_idx, track_id, cx, cy, speed, x_m=x_m, y_m=y_m, speed_mps=speed_mps)
+                tracks_with_meters.append((track_id, x_m, y_m, speed_mps))
             
-            stats.update_ball_stats(ball_detected, max_speed)
-            
-            # Draw ball trajectories
-            ball_tracker.draw_trajectories(frame, tracks)
+            stats.update_ball_stats(ball_detected, max_speed, max_speed_mps)
             
             # Score detection (every N frames for performance)
             if frame_idx % score_detect_interval == 0:
@@ -949,6 +1331,9 @@ def main(video_path, output_dir="tracking_output", save_video=True):
                 scores = score_detector.current_scores
                 rounds = score_detector.rounds
             
+            # Rally aggregation (per-frame; flushes on score change)
+            rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters, scores, rounds)
+            
             # Log if scores changed
             current_score_log = (scores['player1'], scores['player2'], 
                                 rounds['player1'], rounds['player2'])
@@ -956,6 +1341,9 @@ def main(video_path, output_dir="tracking_output", save_video=True):
                 timestamp = frame_idx / fps
                 logger.log_score(frame_idx, timestamp, scores, rounds)
                 last_score_log = current_score_log
+            
+            # Draw ball trajectories
+            ball_tracker.draw_trajectories(frame, tracks)
             
             # Draw score overlay
             score_detector.draw_scores(frame, rois)
@@ -1031,6 +1419,8 @@ def main(video_path, output_dir="tracking_output", save_video=True):
             )
             ball_tracker.trajectories.clear()
             ball_tracker.speed_history.clear()
+            ball_tracker.trajectories_meters.clear()
+            ball_tracker.speed_history_mps.clear()
             print(f"Skipped to frame {frame_idx}")
     
     # Cleanup
@@ -1045,6 +1435,7 @@ def main(video_path, output_dir="tracking_output", save_video=True):
     print("="*60)
     print(f"Trajectory log: {logger.trajectory_file}")
     print(f"Score log: {logger.score_file}")
+    print(f"Rally log: {logger.rally_file}")
     print(f"Configuration: {logger.config_file}")
     if save_video and output_video_path:
         print(f"Output video: {output_video_path}")
@@ -1070,10 +1461,18 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output", s
     for k, v in config['rois'].items():
         rois[k] = tuple(v) if v else None
     
+    table_corners = config.get('table_corners')
+    table_calibration = None
+    if table_corners and len(table_corners) == 4:
+        table_calibration = TableCalibration(table_corners)
+        if not table_calibration.is_valid():
+            table_calibration = None
+    
     print(f"Loaded configuration from: {config_path}")
     print("\nROIs:")
     for name, roi in rois.items():
         print(f"  {name}: {roi}")
+    print("  Table calibration:", "enabled" if table_calibration else "disabled")
     
     # Open video
     cap = cv2.VideoCapture(video_path)
@@ -1093,13 +1492,14 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output", s
     # Initialize components
     print("\nLoading models...")
     print("  - Loading ball detection model...")
-    ball_tracker = BallTracker(BALL_MODEL_PATH, fps)
+    ball_tracker = BallTracker(BALL_MODEL_PATH, fps, table_calibration=table_calibration)
     print("  - Loading digit detection model...")
     score_detector = ScoreDetector(DIGIT_MODEL_PATH)
-    logger = DataLogger(output_dir)
+    logger = DataLogger(output_dir, with_meters=(table_calibration is not None and table_calibration.is_valid()))
+    rally_aggregator = RallyAggregator(fps, logger, table_calibration)
     stats = RealtimeStats(fps)
     print("  - Models loaded!")
-    logger.save_config(rois, video_path, fps)
+    logger.save_config(rois, video_path, fps, table_corners=table_corners)
     
     # Video writer
     video_writer = None
@@ -1128,23 +1528,29 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output", s
         if not paused:
             ret, frame = cap.read()
             if not ret:
+                rally_aggregator.flush_final(frame_idx, frame_idx / fps if fps > 0 else 0)
                 break
             
             tracks = ball_tracker.detect_and_track(frame)
             
             ball_detected = len(tracks) > 0
             max_speed = 0
-            
+            max_speed_mps = None
+            tracks_with_meters = []
             for track in tracks:
                 x1, y1, x2, y2, track_id = track
                 track_id = int(track_id)
                 cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
                 speed = ball_tracker.get_smoothed_speed(track_id)
                 max_speed = max(max_speed, speed)
-                logger.log_trajectory(frame_idx, track_id, cx, cy, speed)
+                x_m, y_m = ball_tracker.get_position_meters(track_id)
+                speed_mps = ball_tracker.get_smoothed_speed_mps(track_id)
+                if speed_mps is not None:
+                    max_speed_mps = max(max_speed_mps or 0, speed_mps)
+                logger.log_trajectory(frame_idx, track_id, cx, cy, speed, x_m=x_m, y_m=y_m, speed_mps=speed_mps)
+                tracks_with_meters.append((track_id, x_m, y_m, speed_mps))
             
-            stats.update_ball_stats(ball_detected, max_speed)
-            ball_tracker.draw_trajectories(frame, tracks)
+            stats.update_ball_stats(ball_detected, max_speed, max_speed_mps)
             
             # Score detection (every N frames for performance)
             if frame_idx % score_detect_interval == 0:
@@ -1153,6 +1559,10 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output", s
             else:
                 scores = score_detector.current_scores
                 rounds = score_detector.rounds
+            
+            rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters, scores, rounds)
+            
+            ball_tracker.draw_trajectories(frame, tracks)
             current_score_log = (scores['player1'], scores['player2'], rounds['player1'], rounds['player2'])
             if current_score_log != last_score_log:
                 timestamp = frame_idx / fps
@@ -1211,6 +1621,8 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output", s
             ball_tracker.tracker = Sort(max_age=TRACKER_MAX_AGE, min_hits=TRACKER_MIN_HITS, iou_threshold=TRACKER_IOU_THRESHOLD)
             ball_tracker.trajectories.clear()
             ball_tracker.speed_history.clear()
+            ball_tracker.trajectories_meters.clear()
+            ball_tracker.speed_history_mps.clear()
     
     # Cleanup
     score_detector.stop()  # Stop OCR thread
@@ -1224,6 +1636,7 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output", s
     print("="*60)
     print(f"Trajectory log: {logger.trajectory_file}")
     print(f"Score log: {logger.score_file}")
+    print(f"Rally log: {logger.rally_file}")
     if output_video_path:
         print(f"Output video: {output_video_path}")
     print(f"Max ball speed: {stats.max_speed:.0f} px/s")
