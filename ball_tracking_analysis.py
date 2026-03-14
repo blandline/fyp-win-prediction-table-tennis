@@ -54,6 +54,25 @@ TABLE_MARGIN_M = 1.5  # accept ball positions up to this far outside the table
 MAX_BALL_SPEED_MPS = 40.0  # world-record smash is ~32 m/s; generous cap
 
 # =============================================================================
+# INFERENCE RESCALING CONFIGURATION
+# =============================================================================
+# Ball detector runs every frame and is the primary throughput bottleneck.
+# Rescaling the frame before inference reduces per-frame YOLO cost significantly
+# while (hopefully) preserving detection quality.
+#
+# Recommended values to evaluate (width, height):
+#   None          -> pass the original frame unchanged (baseline)
+#   (1280, 720)   -> moderate downscale from typical 1920x1080 source (~44 % fewer pixels)
+#   (960, 540)    -> aggressive but still reasonable (75 % fewer pixels vs 1080p)
+#   (640, 360)    -> maximum downscale worth trying for a small ball
+#
+# NOTE: The table-tennis ball is tiny in frame.  Values below 960x540 risk
+# destroying detection accuracy.  Start conservative (1280x720) and work down.
+#
+# Override via CLI: --ball-inference-size 1280x720
+BALL_INFERENCE_SIZE = None   # (width, height) or None for full resolution
+
+# =============================================================================
 # TABLE CALIBRATION (HOMOGRAPHY FOR PIXEL -> METERS)
 # =============================================================================
 class TableCalibration:
@@ -514,7 +533,13 @@ def interactive_frame_setup(frame):
 # BALL TRACKING AND SPEED CALCULATION
 # =============================================================================
 class BallTracker:
-    def __init__(self, model_path, fps, table_calibration=None):
+    def __init__(self, model_path, fps, table_calibration=None, inference_size=None):
+        """
+        inference_size: (width, height) to rescale the frame before YOLO inference,
+                        or None to run inference at the original resolution.
+                        Detections are always mapped back to the original-frame
+                        coordinate space before returning.
+        """
         self.model = YOLO(model_path)
         self.tracker = Sort(
             max_age=TRACKER_MAX_AGE,
@@ -523,24 +548,45 @@ class BallTracker:
         )
         self.fps = fps
         self.table_calibration = table_calibration  # TableCalibration or None
-        
+        self.inference_size = inference_size  # (w, h) or None
+
         # Trajectory history per track ID (pixel coords)
         self.trajectories = {}
         self.speed_history = {}
         # Meter-space trajectory and speed when calibration is set
         self.trajectories_meters = {}
         self.speed_history_mps = {}
-    
+
+    def _prepare_inference_frame(self, frame):
+        """
+        Return (inference_frame, scale_x, scale_y).
+        scale_x / scale_y are the factors needed to map inference-frame pixel
+        coords back to original-frame pixel coords.
+        If inference_size is None the original frame is returned unchanged with
+        scale factors of 1.0.
+        """
+        if self.inference_size is None:
+            return frame, 1.0, 1.0
+        iw, ih = self.inference_size
+        oh, ow = frame.shape[:2]
+        # Avoid an unnecessary copy if the frame is already the target size
+        if ow == iw and oh == ih:
+            return frame, 1.0, 1.0
+        small = cv2.resize(frame, (iw, ih), interpolation=cv2.INTER_LINEAR)
+        return small, ow / iw, oh / ih
+
     def detect_and_track(self, frame):
         """Detect ball and update tracking."""
-        results = self.model(frame, conf=BALL_CONF_THRESHOLD, verbose=False)
-        
+        inf_frame, sx, sy = self._prepare_inference_frame(frame)
+        results = self.model(inf_frame, conf=BALL_CONF_THRESHOLD, verbose=False)
+
         detections = []
         if results and len(results[0].boxes) > 0:
             for box in results[0].boxes:
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 conf = box.conf.item()
-                detections.append([x1, y1, x2, y2, conf])
+                # Scale coordinates back to original frame space
+                detections.append([x1 * sx, y1 * sy, x2 * sx, y2 * sy, conf])
         
         # Convert to numpy array
         if detections:
@@ -1083,7 +1129,13 @@ class RealtimeStats:
         self.max_speed = 0
         self.current_speed_mps = None  # m/s when table calibration is used
         self.max_speed_mps = None
-    
+
+        # Per-phase timing (milliseconds, rolling 30-frame averages)
+        self.t_ball_infer = deque(maxlen=30)   # ball YOLO inference + tracker
+        self.t_score_infer = deque(maxlen=30)  # score YOLO (when it runs)
+        self.t_draw = deque(maxlen=30)         # drawing overlays
+        self.t_write = deque(maxlen=30)        # video writer
+
     def update(self):
         import time
         current = time.time()
@@ -1092,7 +1144,19 @@ class RealtimeStats:
             if self.frame_times:
                 self.current_fps = 1.0 / np.mean(self.frame_times)
         self.last_time = current
-    
+
+    def record_phase(self, phase, elapsed_sec):
+        """Record elapsed time (seconds) for a named phase."""
+        ms = elapsed_sec * 1000.0
+        if phase == 'ball_infer':
+            self.t_ball_infer.append(ms)
+        elif phase == 'score_infer':
+            self.t_score_infer.append(ms)
+        elif phase == 'draw':
+            self.t_draw.append(ms)
+        elif phase == 'write':
+            self.t_write.append(ms)
+
     def update_ball_stats(self, detected, speed, speed_mps=None):
         self.ball_detected = detected
         if detected and speed > 0:
@@ -1101,110 +1165,148 @@ class RealtimeStats:
         if speed_mps is not None and speed_mps > 0:
             self.current_speed_mps = speed_mps
             self.max_speed_mps = max(self.max_speed_mps or 0, speed_mps)
-    
+
     def draw(self, frame, frame_idx, total_frames, paused, playback_speed):
         h, w = frame.shape[:2]
-        
-        # Stats panel background (bottom-left)
+
+        # Stats panel background (bottom-left) — extended for timing rows
         overlay = frame.copy()
-        panel_h = 120
-        cv2.rectangle(overlay, (10, h - panel_h - 10), (280, h - 10), (0, 0, 0), -1)
+        panel_h = 155
+        cv2.rectangle(overlay, (10, h - panel_h - 10), (310, h - 10), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-        
+
         y = h - panel_h + 5
         line_height = 18
-        
+
         # Processing FPS
         fps_color = (0, 255, 0) if self.current_fps >= self.video_fps * 0.9 else (0, 255, 255) if self.current_fps >= self.video_fps * 0.5 else (0, 0, 255)
-        cv2.putText(frame, f"Processing: {self.current_fps:.1f} FPS", (20, y), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, fps_color, 1)
+        cv2.putText(frame, f"Processing: {self.current_fps:.1f} FPS", (20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, fps_color, 1)
         y += line_height
-        
+
         # Video FPS
-        cv2.putText(frame, f"Video: {self.video_fps:.1f} FPS | Speed: {playback_speed:.1f}x", 
-                   (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(frame, f"Video: {self.video_fps:.1f} FPS | Speed: {playback_speed:.1f}x",
+                    (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         y += line_height
-        
+
         # Ball status
         ball_color = (0, 255, 0) if self.ball_detected else (100, 100, 100)
         ball_status = "DETECTED" if self.ball_detected else "NOT FOUND"
-        cv2.putText(frame, f"Ball: {ball_status}", (20, y), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, ball_color, 1)
+        cv2.putText(frame, f"Ball: {ball_status}", (20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, ball_color, 1)
         y += line_height
-        
+
         # Speed (m/s when table calibrated, else px/s)
         if self.max_speed_mps is not None and self.max_speed_mps > 0:
             cur = f"{self.current_speed_mps:.2f}" if self.current_speed_mps is not None else "0.00"
-            cv2.putText(frame, f"Speed: {cur} m/s", (20, y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+            cv2.putText(frame, f"Speed: {cur} m/s", (20, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
             y += line_height
-            cv2.putText(frame, f"Max Speed: {self.max_speed_mps:.2f} m/s", (20, y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
+            cv2.putText(frame, f"Max Speed: {self.max_speed_mps:.2f} m/s", (20, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
             y += line_height
         else:
-            cv2.putText(frame, f"Speed: {self.current_speed:.0f} px/s", (20, y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+            cv2.putText(frame, f"Speed: {self.current_speed:.0f} px/s", (20, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
             y += line_height
-            cv2.putText(frame, f"Max Speed: {self.max_speed:.0f} px/s", (20, y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
+            cv2.putText(frame, f"Max Speed: {self.max_speed:.0f} px/s", (20, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
             y += line_height
-        
+
+        # Per-phase timings
+        def _avg_ms(q):
+            return f"{np.mean(q):.1f}" if q else "---"
+
+        cv2.putText(frame, f"BallInfer: {_avg_ms(self.t_ball_infer)}ms  Score: {_avg_ms(self.t_score_infer)}ms",
+                    (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (160, 200, 255), 1)
+        y += line_height
+        cv2.putText(frame, f"Draw: {_avg_ms(self.t_draw)}ms  Write: {_avg_ms(self.t_write)}ms",
+                    (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (160, 200, 255), 1)
+        y += line_height
+
         # Progress
         progress = frame_idx / total_frames if total_frames > 0 else 0
         time_sec = frame_idx / self.video_fps
         total_time = total_frames / self.video_fps
-        cv2.putText(frame, f"Time: {time_sec:.1f}s / {total_time:.1f}s ({progress*100:.1f}%)", 
-                   (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        
+        cv2.putText(frame, f"Time: {time_sec:.1f}s / {total_time:.1f}s ({progress*100:.1f}%)",
+                    (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
         # Progress bar (top)
         bar_y = 5
         bar_h = 8
         cv2.rectangle(frame, (10, bar_y), (w - 10, bar_y + bar_h), (50, 50, 50), -1)
         cv2.rectangle(frame, (10, bar_y), (10 + int((w - 20) * progress), bar_y + bar_h), (0, 200, 0), -1)
-        
+
         # Pause indicator
         if paused:
-            cv2.putText(frame, "PAUSED", (w // 2 - 50, h // 2), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-        
+            cv2.putText(frame, "PAUSED", (w // 2 - 50, h // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+
         # Controls hint (top-right)
-        cv2.putText(frame, "Q:Quit P:Pause +/-:Speed S:Screenshot", 
-                   (w - 350, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+        cv2.putText(frame, "Q:Quit P:Pause +/-:Speed S:Screenshot",
+                    (w - 350, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
 
 # =============================================================================
 # MAIN APPLICATION
 # =============================================================================
-def main(video_path, output_dir="tracking_output", save_video=True):
-    """Main entry point for ball tracking and score detection."""
+def main(video_path, output_dir="tracking_output", save_video=True,
+         inference_size=None, benchmark_frames=0,
+         score_interval_sec=2.0, output_size=None):
+    """
+    Main entry point for ball tracking and score detection.
+
+    inference_size:     (width, height) for ball-detector rescaling, or None.
+    benchmark_frames:   if > 0, run headless for this many frames and exit.
+    score_interval_sec: seconds between score-detector runs (default 2.0).
+    output_size:        (width, height) to downscale the saved output video,
+                        or None to write at the original resolution.
+    """
     import time
-    
+
     print("\n" + "="*60)
     print("BALL TRACKING AND SCORE DETECTION SYSTEM")
     print("="*60)
-    
+
     # Open video
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error: Could not open video: {video_path}")
         return
-    
+
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
+
     print(f"Video: {video_path}")
     print(f"Resolution: {frame_width}x{frame_height}")
     print(f"FPS: {fps}")
     print(f"Total frames: {total_frames}")
-    
+    if inference_size:
+        print(f"Ball inference size: {inference_size[0]}x{inference_size[1]}")
+    else:
+        print(f"Ball inference size: {frame_width}x{frame_height} (full resolution / baseline)")
+    if output_size:
+        print(f"Output video size:   {output_size[0]}x{output_size[1]}")
+    else:
+        print(f"Output video size:   {frame_width}x{frame_height} (full resolution)")
+
+    # -------------------------------------------------------------------------
+    # BENCHMARK MODE: headless, no interactive setup, no display
+    # -------------------------------------------------------------------------
+    if benchmark_frames > 0:
+        _run_benchmark(cap, fps, frame_width, frame_height,
+                       inference_size, benchmark_frames)
+        cap.release()
+        return
+
     # Read first frame for setup
     ret, first_frame = cap.read()
     if not ret:
         print("Error: Could not read first frame")
         return
-    
+
     # Interactive setup
     print("\nStarting interactive setup...")
     result = interactive_frame_setup(first_frame)
@@ -1212,7 +1314,7 @@ def main(video_path, output_dir="tracking_output", save_video=True):
         print("Setup cancelled.")
         return
     rois, table_corners = result
-    
+
     print("\nROIs configured:")
     for name, roi in rois.items():
         print(f"  {name}: {roi}")
@@ -1220,7 +1322,7 @@ def main(video_path, output_dir="tracking_output", save_video=True):
         print("  Table corners: 4 points set (homography enabled)")
     else:
         print("  Table corners: not set (ball speed in px/s only)")
-    
+
     # Table calibration (optional)
     table_calibration = None
     if len(table_corners) == 4:
@@ -1230,44 +1332,48 @@ def main(video_path, output_dir="tracking_output", save_video=True):
         else:
             print("  Table calibration failed sanity checks; continuing without meter-space features.")
             table_calibration = None
-    
+
     # Initialize components
     print("\nLoading models...")
     print("  - Loading ball detection model...")
-    ball_tracker = BallTracker(BALL_MODEL_PATH, fps, table_calibration=table_calibration)
+    ball_tracker = BallTracker(BALL_MODEL_PATH, fps,
+                               table_calibration=table_calibration,
+                               inference_size=inference_size)
     print("  - Loading digit detection model...")
     score_detector = ScoreDetector(DIGIT_MODEL_PATH)
     logger = DataLogger(output_dir, with_meters=(table_calibration is not None and table_calibration.is_valid()))
     rally_aggregator = RallyAggregator(fps, logger, table_calibration)
     stats = RealtimeStats(fps)
     print("  - Models loaded!")
-    
+
     # Save configuration
     logger.save_config(rois, video_path, fps, table_corners=table_corners)
-    
+
     # Reset video to beginning
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    
+
     # Create output window
     cv2.namedWindow("Ball Tracking - Real-Time", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Ball Tracking - Real-Time", 1280, 720)
-    
+
     # Video writer for output
     video_writer = None
     output_video_path = None
+    write_w = output_size[0] if output_size else frame_width
+    write_h = output_size[1] if output_size else frame_height
     if save_video:
         output_video_path = Path(output_dir) / f"tracked_{Path(video_path).stem}.mp4"
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         video_writer = cv2.VideoWriter(
-            str(output_video_path), fourcc, fps, 
-            (frame_width, frame_height)
+            str(output_video_path), fourcc, fps,
+            (write_w, write_h)
         )
-        print(f"Output video will be saved to: {output_video_path}")
-    
-    # Processing settings - detect score every ~0.5 second (YOLO is fast)
-    score_detect_interval = max(1, int(fps * 0.5))
+        print(f"Output video will be saved to: {output_video_path} ({write_w}x{write_h})")
+
+    # Score detection interval (configurable to reduce expensive YOLO calls)
+    score_detect_interval = max(1, int(fps * score_interval_sec))
     last_score_log = None
-    
+
     print("\n" + "="*60)
     print("REAL-TIME TRACKING STARTED")
     print("="*60)
@@ -1281,15 +1387,15 @@ def main(video_path, output_dir="tracking_output", save_video=True):
     print("  </>    : Skip backward/forward 5 seconds")
     print("  SPACE  : Step frame (when paused)")
     print("="*60 + "\n")
-    
+
     frame_idx = 0
     paused = False
     playback_speed = 1.0  # 1.0 = real-time
     frame_delay_base = 1.0 / fps  # Base delay between frames
-    
+
     while cap.isOpened():
         loop_start = time.time()
-        
+
         if not paused:
             ret, frame = cap.read()
             if not ret:
@@ -1297,14 +1403,16 @@ def main(video_path, output_dir="tracking_output", save_video=True):
                 print("\nEnd of video reached.")
                 rally_aggregator.flush_final(frame_idx, frame_idx / fps if fps > 0 else 0)
                 break
-            
-            # Ball detection and tracking
+
+            # Ball detection and tracking (timed)
+            t0 = time.perf_counter()
             tracks = ball_tracker.detect_and_track(frame)
-            
+            stats.record_phase('ball_infer', time.perf_counter() - t0)
+
             # Update stats
             ball_detected = len(tracks) > 0
             max_speed = 0
-            
+
             # Log trajectories (with optional meter-space columns)
             tracks_with_meters = []
             max_speed_mps = None
@@ -1320,46 +1428,52 @@ def main(video_path, output_dir="tracking_output", save_video=True):
                     max_speed_mps = max(max_speed_mps or 0, speed_mps)
                 logger.log_trajectory(frame_idx, track_id, cx, cy, speed, x_m=x_m, y_m=y_m, speed_mps=speed_mps)
                 tracks_with_meters.append((track_id, x_m, y_m, speed_mps))
-            
+
             stats.update_ball_stats(ball_detected, max_speed, max_speed_mps)
-            
-            # Score detection (every N frames for performance)
+
+            # Score detection (every N frames for performance, timed)
             if frame_idx % score_detect_interval == 0:
+                t0 = time.perf_counter()
                 scores = score_detector.update_scores(frame, rois, frame_idx)
                 rounds = score_detector.detect_rounds(frame, rois)
+                stats.record_phase('score_infer', time.perf_counter() - t0)
             else:
                 scores = score_detector.current_scores
                 rounds = score_detector.rounds
-            
+
             # Rally aggregation (per-frame; flushes on score change)
             rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters, scores, rounds)
-            
+
             # Log if scores changed
-            current_score_log = (scores['player1'], scores['player2'], 
-                                rounds['player1'], rounds['player2'])
+            current_score_log = (scores['player1'], scores['player2'],
+                                 rounds['player1'], rounds['player2'])
             if current_score_log != last_score_log:
                 timestamp = frame_idx / fps
                 logger.log_score(frame_idx, timestamp, scores, rounds)
                 last_score_log = current_score_log
-            
-            # Draw ball trajectories
+
+            # Draw overlays (timed)
+            t0 = time.perf_counter()
             ball_tracker.draw_trajectories(frame, tracks)
-            
-            # Draw score overlay
             score_detector.draw_scores(frame, rois)
-            
+            stats.record_phase('draw', time.perf_counter() - t0)
+
             # Update FPS stats
             stats.update()
-            
-            # Write to output video (without stats overlay for clean output)
+
+            # Write to output video (downscale if requested, timed)
             if video_writer:
-                video_writer.write(frame.copy())
-            
+                t0 = time.perf_counter()
+                write_frame = (cv2.resize(frame, (write_w, write_h), interpolation=cv2.INTER_LINEAR)
+                               if output_size else frame)
+                video_writer.write(write_frame)
+                stats.record_phase('write', time.perf_counter() - t0)
+
             frame_idx += 1
-        
+
         # Draw real-time stats overlay (after saving clean frame)
         stats.draw(frame, frame_idx, total_frames, paused, playback_speed)
-        
+
         # Display
         cv2.imshow("Ball Tracking - Real-Time", frame)
         
@@ -1442,57 +1556,74 @@ def main(video_path, output_dir="tracking_output", save_video=True):
     print(f"\nMax ball speed recorded: {stats.max_speed:.0f} px/s")
 
 
-def load_config_and_run(video_path, config_path, output_dir="tracking_output", save_video=True):
+def load_config_and_run(video_path, config_path, output_dir="tracking_output",
+                        save_video=True, inference_size=None,
+                        score_interval_sec=2.0, output_size=None):
     """
     Run tracking with pre-saved ROI configuration (skip interactive setup).
     Useful for batch processing or re-running with same settings.
+
+    inference_size:     (width, height) for ball-detector rescaling, or None.
+    score_interval_sec: seconds between score-detector runs (default 2.0).
+    output_size:        (width, height) to downscale the saved output video,
+                        or None to write at the original resolution.
     """
     import time
-    
+
     print("\n" + "="*60)
     print("BALL TRACKING - USING SAVED CONFIGURATION")
     print("="*60)
-    
+
     # Load config
     with open(config_path, 'r') as f:
         config = json.load(f)
-    
+
     rois = {}
     for k, v in config['rois'].items():
         rois[k] = tuple(v) if v else None
-    
+
     table_corners = config.get('table_corners')
     table_calibration = None
     if table_corners and len(table_corners) == 4:
         table_calibration = TableCalibration(table_corners)
         if not table_calibration.is_valid():
             table_calibration = None
-    
+
     print(f"Loaded configuration from: {config_path}")
     print("\nROIs:")
     for name, roi in rois.items():
         print(f"  {name}: {roi}")
     print("  Table calibration:", "enabled" if table_calibration else "disabled")
-    
+
     # Open video
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error: Could not open video: {video_path}")
         return
-    
+
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
+
     print(f"\nVideo: {video_path}")
     print(f"Resolution: {frame_width}x{frame_height}")
     print(f"FPS: {fps}")
-    
+    if inference_size:
+        print(f"Ball inference size: {inference_size[0]}x{inference_size[1]}")
+    else:
+        print(f"Ball inference size: {frame_width}x{frame_height} (full resolution / baseline)")
+    if output_size:
+        print(f"Output video size:   {output_size[0]}x{output_size[1]}")
+    else:
+        print(f"Output video size:   {frame_width}x{frame_height} (full resolution)")
+
     # Initialize components
     print("\nLoading models...")
     print("  - Loading ball detection model...")
-    ball_tracker = BallTracker(BALL_MODEL_PATH, fps, table_calibration=table_calibration)
+    ball_tracker = BallTracker(BALL_MODEL_PATH, fps,
+                               table_calibration=table_calibration,
+                               inference_size=inference_size)
     print("  - Loading digit detection model...")
     score_detector = ScoreDetector(DIGIT_MODEL_PATH)
     logger = DataLogger(output_dir, with_meters=(table_calibration is not None and table_calibration.is_valid()))
@@ -1500,39 +1631,45 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output", s
     stats = RealtimeStats(fps)
     print("  - Models loaded!")
     logger.save_config(rois, video_path, fps, table_corners=table_corners)
-    
-    # Video writer
+
+    # Video writer (optionally downscaled)
     video_writer = None
     output_video_path = None
+    write_w = output_size[0] if output_size else frame_width
+    write_h = output_size[1] if output_size else frame_height
     if save_video:
         output_video_path = Path(output_dir) / f"tracked_{Path(video_path).stem}.mp4"
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video_writer = cv2.VideoWriter(str(output_video_path), fourcc, fps, (frame_width, frame_height))
-    
+        video_writer = cv2.VideoWriter(str(output_video_path), fourcc, fps, (write_w, write_h))
+        print(f"Output video will be saved to: {output_video_path} ({write_w}x{write_h})")
+
     cv2.namedWindow("Ball Tracking - Real-Time", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Ball Tracking - Real-Time", 1280, 720)
-    
-    score_detect_interval = int(fps * 1.0)  # Detect score every ~1 second
+
+    score_detect_interval = max(1, int(fps * score_interval_sec))
     last_score_log = None
     frame_idx = 0
     paused = False
     playback_speed = 1.0
     frame_delay_base = 1.0 / fps
-    
+
     print("\nReal-time tracking started...")
     print("Controls: Q=Quit, P=Pause, +/-=Speed, S=Screenshot, </.>=Skip")
-    
+
     while cap.isOpened():
         loop_start = time.time()
-        
+
         if not paused:
             ret, frame = cap.read()
             if not ret:
                 rally_aggregator.flush_final(frame_idx, frame_idx / fps if fps > 0 else 0)
                 break
-            
+
+            # Ball detection (timed)
+            t0 = time.perf_counter()
             tracks = ball_tracker.detect_and_track(frame)
-            
+            stats.record_phase('ball_infer', time.perf_counter() - t0)
+
             ball_detected = len(tracks) > 0
             max_speed = 0
             max_speed_mps = None
@@ -1549,44 +1686,53 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output", s
                     max_speed_mps = max(max_speed_mps or 0, speed_mps)
                 logger.log_trajectory(frame_idx, track_id, cx, cy, speed, x_m=x_m, y_m=y_m, speed_mps=speed_mps)
                 tracks_with_meters.append((track_id, x_m, y_m, speed_mps))
-            
+
             stats.update_ball_stats(ball_detected, max_speed, max_speed_mps)
-            
-            # Score detection (every N frames for performance)
+
+            # Score detection (every N frames, timed)
             if frame_idx % score_detect_interval == 0:
+                t0 = time.perf_counter()
                 scores = score_detector.update_scores(frame, rois, frame_idx)
                 rounds = score_detector.detect_rounds(frame, rois)
+                stats.record_phase('score_infer', time.perf_counter() - t0)
             else:
                 scores = score_detector.current_scores
                 rounds = score_detector.rounds
-            
+
             rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters, scores, rounds)
-            
+
+            # Draw overlays (timed)
+            t0 = time.perf_counter()
             ball_tracker.draw_trajectories(frame, tracks)
             current_score_log = (scores['player1'], scores['player2'], rounds['player1'], rounds['player2'])
             if current_score_log != last_score_log:
                 timestamp = frame_idx / fps
                 logger.log_score(frame_idx, timestamp, scores, rounds)
                 last_score_log = current_score_log
-            
             score_detector.draw_scores(frame, rois)
+            stats.record_phase('draw', time.perf_counter() - t0)
+
             stats.update()
-            
+
             if video_writer:
-                video_writer.write(frame.copy())
-            
+                t0 = time.perf_counter()
+                write_frame = (cv2.resize(frame, (write_w, write_h), interpolation=cv2.INTER_LINEAR)
+                               if output_size else frame)
+                video_writer.write(write_frame)
+                stats.record_phase('write', time.perf_counter() - t0)
+
             frame_idx += 1
-        
+
         stats.draw(frame, frame_idx, total_frames, paused, playback_speed)
         cv2.imshow("Ball Tracking - Real-Time", frame)
-        
+
         processing_time = time.time() - loop_start
         wait_time = max(1, int((frame_delay_base / playback_speed - processing_time) * 1000))
         if paused:
             wait_time = 0
-        
+
         key = cv2.waitKey(wait_time) & 0xFF
-        
+
         if key == ord('q'):
             break
         elif key == ord('p'):
@@ -1623,14 +1769,14 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output", s
             ball_tracker.speed_history.clear()
             ball_tracker.trajectories_meters.clear()
             ball_tracker.speed_history_mps.clear()
-    
+
     # Cleanup
-    score_detector.stop()  # Stop OCR thread
+    score_detector.stop()
     cap.release()
     if video_writer:
         video_writer.release()
     cv2.destroyAllWindows()
-    
+
     print("\n" + "="*60)
     print("COMPLETE")
     print("="*60)
@@ -1642,9 +1788,89 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output", s
     print(f"Max ball speed: {stats.max_speed:.0f} px/s")
 
 
+# =============================================================================
+# BENCHMARK HELPER
+# =============================================================================
+def _run_benchmark(cap, fps, frame_width, frame_height, inference_size, n_frames):
+    """
+    Headless benchmark: measure ball-inference FPS over n_frames frames.
+    No display, no video writing, no score detection.
+    Prints a concise summary on completion.
+    """
+    import time
+
+    inf_label = (f"{inference_size[0]}x{inference_size[1]}"
+                 if inference_size else f"{frame_width}x{frame_height} (full)")
+    print(f"\n{'='*60}")
+    print(f"BENCHMARK MODE  —  inference size: {inf_label}")
+    print(f"Frames to process: {n_frames}")
+    print(f"{'='*60}")
+
+    ball_tracker = BallTracker(BALL_MODEL_PATH, fps, inference_size=inference_size)
+
+    # Warm-up (1 frame to load CUDA kernels / model cache)
+    ret, frame = cap.read()
+    if not ret:
+        print("Error: could not read frame for warm-up.")
+        return
+    ball_tracker.detect_and_track(frame)
+    print("Warm-up done. Starting benchmark...")
+
+    ball_times = []
+    total_start = time.perf_counter()
+
+    for i in range(n_frames):
+        ret, frame = cap.read()
+        if not ret:
+            print(f"  Video ended after {i} frames.")
+            break
+        t0 = time.perf_counter()
+        ball_tracker.detect_and_track(frame)
+        ball_times.append(time.perf_counter() - t0)
+
+    total_elapsed = time.perf_counter() - total_start
+    n = len(ball_times)
+    if n == 0:
+        print("No frames processed.")
+        return
+
+    avg_ms = np.mean(ball_times) * 1000
+    p50_ms = np.median(ball_times) * 1000
+    p95_ms = np.percentile(ball_times, 95) * 1000
+    throughput_fps = n / total_elapsed
+
+    print(f"\n{'='*60}")
+    print(f"BENCHMARK RESULTS  ({n} frames, inference size: {inf_label})")
+    print(f"{'='*60}")
+    print(f"  Ball-infer avg latency : {avg_ms:.1f} ms")
+    print(f"  Ball-infer p50 latency : {p50_ms:.1f} ms")
+    print(f"  Ball-infer p95 latency : {p95_ms:.1f} ms")
+    print(f"  Overall throughput     : {throughput_fps:.1f} FPS  "
+          f"(wall-clock over {total_elapsed:.1f}s)")
+    print(f"  Source video FPS       : {fps:.0f}")
+    ratio = throughput_fps / fps if fps > 0 else 0
+    status = "REAL-TIME OK" if ratio >= 1.0 else f"DEFICIT  ({ratio:.2f}x source)"
+    print(f"  Real-time ratio        : {ratio:.2f}x  ->  {status}")
+    print(f"{'='*60}\n")
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+def _parse_inference_size(s):
+    """Parse 'WxH' or 'WxH' string to (int, int) tuple."""
+    try:
+        w, h = s.lower().split('x')
+        return int(w), int(h)
+    except Exception:
+        raise argparse.ArgumentTypeError(
+            f"Invalid inference size '{s}'. Expected format: WxH  e.g. 1280x720"
+        )
+
+
 if __name__ == "__main__":
     import argparse
-    
+
     parser = argparse.ArgumentParser(
         description="Ball Tracking and Score Detection for Table Tennis",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1652,28 +1878,77 @@ if __name__ == "__main__":
 Examples:
   # Interactive mode (mark ROIs on first frame)
   python ball_tracking_analysis.py game_1.mp4
-  
-  # With custom output directory
-  python ball_tracking_analysis.py game_1.mp4 -o my_output
-  
+
+  # Recommended fast config: 640x360 inference, 960x540 output, score every 2s
+  python ball_tracking_analysis.py game_1.mp4 --ball-inference-size 640x360 --output-size 960x540
+
   # Use previously saved configuration
   python ball_tracking_analysis.py game_2.mp4 --config tracking_output/config_20260126.json
-  
-  # Disable video output (faster processing)
+
+  # Disable video output (fastest, no write overhead)
   python ball_tracking_analysis.py game_1.mp4 --no-video
+
+  # Check score only every 3 seconds instead of default 2
+  python ball_tracking_analysis.py game_1.mp4 --score-interval 3.0
+
+  # Headless benchmark: measure ball-infer FPS at different resolutions
+  python ball_tracking_analysis.py game_1.mp4 --benchmark 300
+  python ball_tracking_analysis.py game_1.mp4 --benchmark 300 --ball-inference-size 640x360
         """
     )
     parser.add_argument("video", help="Path to input video file")
-    parser.add_argument("--output", "-o", default="tracking_output", 
-                       help="Output directory for logs and video (default: tracking_output)")
+    parser.add_argument("--output", "-o", default="tracking_output",
+                        help="Output directory for logs and video (default: tracking_output)")
     parser.add_argument("--config", "-c", default=None,
-                       help="Path to saved config JSON (skip interactive setup)")
+                        help="Path to saved config JSON (skip interactive setup)")
     parser.add_argument("--no-video", action="store_true",
-                       help="Don't save output video (faster processing)")
-    
+                        help="Don't save output video (faster processing)")
+    parser.add_argument(
+        "--ball-inference-size", metavar="WxH", default=None,
+        type=_parse_inference_size,
+        help=(
+            "Resize frame to WxH before ball-detector inference, then map "
+            "boxes back to original resolution.  Suggested: 960x540 or 640x360."
+        )
+    )
+    parser.add_argument(
+        "--output-size", metavar="WxH", default=None,
+        type=_parse_inference_size,
+        help=(
+            "Downscale the saved output video to WxH.  The live display window "
+            "always shows the original resolution.  Suggested: 960x540 or 1280x720.  "
+            "Reduces video-write cost significantly on high-res sources."
+        )
+    )
+    parser.add_argument(
+        "--score-interval", metavar="SEC", type=float, default=2.0,
+        help=(
+            "How often (in seconds) to run the score detector (default: 2.0).  "
+            "Higher values reduce YOLO score calls; scores change slowly so "
+            "2–3 seconds is safe.  Use 0.5 for the original behaviour."
+        )
+    )
+    parser.add_argument(
+        "--benchmark", metavar="N", type=int, default=0,
+        help=(
+            "Run a headless ball-inference benchmark over N frames and exit.  "
+            "No display, no logging, no interactive setup required.  "
+            "Combine with --ball-inference-size to compare resolutions."
+        )
+    )
+
     args = parser.parse_args()
-    
+
+    # Resolve inference size: CLI flag overrides module-level constant
+    inf_size = args.ball_inference_size if args.ball_inference_size is not None else BALL_INFERENCE_SIZE
+    out_size = args.output_size  # None means full resolution
+
     if args.config:
-        load_config_and_run(args.video, args.config, args.output, not args.no_video)
+        load_config_and_run(args.video, args.config, args.output,
+                            not args.no_video, inference_size=inf_size,
+                            score_interval_sec=args.score_interval,
+                            output_size=out_size)
     else:
-        main(args.video, args.output, not args.no_video)
+        main(args.video, args.output, not args.no_video,
+             inference_size=inf_size, benchmark_frames=args.benchmark,
+             score_interval_sec=args.score_interval, output_size=out_size)
