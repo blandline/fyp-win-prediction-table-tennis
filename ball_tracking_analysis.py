@@ -70,6 +70,8 @@ def resolve_model_path(pt_path, require_engine=False):
 # Detection settings
 BALL_CONF_THRESHOLD = 0.35
 DIGIT_CONF_THRESHOLD = 0.35
+# Only update score when mean digit confidence >= this (avoids wrong reads when panel obscured)
+MIN_DIGIT_CONF_RELIABLE = 0.5
 
 # Tracker settings
 TRACKER_MAX_AGE = 5  # Frames to keep tracking without detection
@@ -747,6 +749,10 @@ class ScoreDetector:
             'player1': 0,
             'player2': 0
         }
+        # True when score ROI had no or low-confidence detections (panel possibly obscured)
+        self.score_roi_obscured = {'player1': False, 'player2': False}
+        # True when rounds/sets ROI had no or low-confidence detections
+        self.rounds_roi_obscured = {'player1': False, 'player2': False}
     
     def stop(self):
         """Cleanup (no-op for YOLO, kept for API compatibility)."""
@@ -795,9 +801,13 @@ class ScoreDetector:
         return processed
     
     def detect_digits_in_roi(self, frame, roi, use_preprocessing=True, debug=False):
-        """Detect digits in a region of interest using YOLO."""
+        """Detect digits in a region of interest using YOLO.
+        Returns dict with keys: score (int or None), num_detections (int), mean_conf (float).
+        Used to avoid updating score when panel is obscured (0 or low-confidence detections).
+        """
+        empty_result = {'score': None, 'num_detections': 0, 'mean_conf': 0.0}
         if roi is None:
-            return None
+            return empty_result
         
         x1, y1, x2, y2 = roi
         
@@ -809,7 +819,7 @@ class ScoreDetector:
         crop = frame[y1:y2, x1:x2]
         
         if crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
-            return None
+            return empty_result
         
         # Try with preprocessing first, then without if no result
         images_to_try = []
@@ -859,21 +869,29 @@ class ScoreDetector:
                 score = int(score_str)
                 if score > 30:  # Invalid table tennis score
                     continue
-                return score
+                num_det = len(digits)
+                mean_conf = sum(d['conf'] for d in digits) / num_det
+                return {'score': score, 'num_detections': num_det, 'mean_conf': mean_conf}
             except ValueError:
                 continue
         
-        return None
+        return empty_result
     
     def update_scores(self, frame, rois, frame_idx):
-        """Update scores from detected digits."""
+        """Update scores from detected digits. Only accepts readings when the score panel
+        appears reliable (enough detections and confidence), to avoid wrong scores when obscured.
+        """
         for player, roi_key in [('player1', 'player1_score'), ('player2', 'player2_score')]:
             roi = rois.get(roi_key)
             if roi:
-                score = self.detect_digits_in_roi(frame, roi)
-                if score is not None:
+                result = self.detect_digits_in_roi(frame, roi)
+                score = result['score']
+                num_det = result['num_detections']
+                mean_conf = result['mean_conf']
+                reliable = (num_det >= 1 and mean_conf >= MIN_DIGIT_CONF_RELIABLE)
+                self.score_roi_obscured[player] = not reliable
+                if reliable and score is not None:
                     self.score_history[player].append(score)
-                    
                     # Use majority voting for stability
                     if len(self.score_history[player]) >= 3:
                         from collections import Counter
@@ -886,12 +904,19 @@ class ScoreDetector:
         return self.current_scores
     
     def detect_rounds(self, frame, rois):
-        """Detect rounds won from round indicator ROIs."""
+        """Detect rounds/sets won from round indicator ROIs. Only updates when reading is
+        reliable (same obscurity logic as score) to avoid wrong set counts when obscured.
+        """
         for player, roi_key in [('player1', 'player1_rounds'), ('player2', 'player2_rounds')]:
             roi = rois.get(roi_key)
             if roi:
-                rounds = self.detect_digits_in_roi(frame, roi)
-                if rounds is not None and rounds <= 5:  # Max 5 games in a match
+                result = self.detect_digits_in_roi(frame, roi)
+                rounds = result['score']
+                num_det = result['num_detections']
+                mean_conf = result['mean_conf']
+                reliable = (num_det >= 1 and mean_conf >= MIN_DIGIT_CONF_RELIABLE)
+                self.rounds_roi_obscured[player] = not reliable
+                if reliable and rounds is not None and rounds <= 5:  # Max 5 games in a match
                     self.rounds[player] = rounds
         
         return self.rounds
@@ -909,9 +934,12 @@ class ScoreDetector:
         
         p1_score = self.current_scores['player1']
         p1_score_text = str(p1_score) if p1_score is not None else "--"
+        if self.score_roi_obscured['player1']:
+            p1_score_text += " (obscured)"
         cv2.putText(frame, "Player 1", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         cv2.putText(frame, p1_score_text, (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
-        cv2.putText(frame, f"Sets: {self.rounds['player1']}", (120, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        sets_p1 = str(self.rounds['player1']) + (" (obscured)" if self.rounds_roi_obscured['player1'] else "")
+        cv2.putText(frame, f"Sets: {sets_p1}", (120, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
         
         # Player 2 score box (right)
         overlay = frame.copy()
@@ -920,9 +948,12 @@ class ScoreDetector:
         
         p2_score = self.current_scores['player2']
         p2_score_text = str(p2_score) if p2_score is not None else "--"
+        if self.score_roi_obscured['player2']:
+            p2_score_text += " (obscured)"
         cv2.putText(frame, "Player 2", (w - 190, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         cv2.putText(frame, p2_score_text, (w - 190, 85), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
-        cv2.putText(frame, f"Sets: {self.rounds['player2']}", (w - 90, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        sets_p2 = str(self.rounds['player2']) + (" (obscured)" if self.rounds_roi_obscured['player2'] else "")
+        cv2.putText(frame, f"Sets: {sets_p2}", (w - 90, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
         
         # Draw ROI boxes on frame
         for roi_name, roi in rois.items():
@@ -1079,7 +1110,7 @@ class DataLogger:
         # Score log
         self.score_file = self.output_dir / f"scores_{timestamp}.csv"
         with open(self.score_file, 'w') as f:
-            f.write("frame,timestamp_sec,player1_score,player2_score,player1_sets,player2_sets\n")
+            f.write("frame,timestamp_sec,player1_score,player2_score,player1_sets,player2_sets,player1_obscured,player2_obscured,player1_sets_obscured,player2_sets_obscured\n")
         
         # Rally log (Stage 1: ball + score + placement)
         self.rally_file = self.output_dir / f"rallies_{timestamp}.csv"
@@ -1107,11 +1138,15 @@ class DataLogger:
         with open(self.trajectory_file, 'a') as f:
             f.write(line + "\n")
     
-    def log_score(self, frame_idx, timestamp, scores, rounds):
+    def log_score(self, frame_idx, timestamp, scores, rounds, obscured=None, obscured_rounds=None):
         with open(self.score_file, 'a') as f:
             p1 = scores['player1'] if scores['player1'] is not None else ''
             p2 = scores['player2'] if scores['player2'] is not None else ''
-            f.write(f"{frame_idx},{timestamp:.2f},{p1},{p2},{rounds['player1']},{rounds['player2']}\n")
+            o1 = 1 if (obscured and obscured.get('player1')) else 0
+            o2 = 1 if (obscured and obscured.get('player2')) else 0
+            r1 = 1 if (obscured_rounds and obscured_rounds.get('player1')) else 0
+            r2 = 1 if (obscured_rounds and obscured_rounds.get('player2')) else 0
+            f.write(f"{frame_idx},{timestamp:.2f},{p1},{p2},{rounds['player1']},{rounds['player2']},{o1},{o2},{r1},{r2}\n")
     
     def log_rally(self, record):
         """Append one rally feature row (dict with keys matching CSV header)."""
@@ -1497,7 +1532,7 @@ def main(video_path, output_dir="tracking_output", save_video=True,
                                  rounds['player1'], rounds['player2'])
             if current_score_log != last_score_log:
                 timestamp = frame_idx / fps
-                logger.log_score(frame_idx, timestamp, scores, rounds)
+                logger.log_score(frame_idx, timestamp, scores, rounds, score_detector.score_roi_obscured, score_detector.rounds_roi_obscured)
                 last_score_log = current_score_log
 
             # Draw overlays (timed)
@@ -1768,7 +1803,7 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
             current_score_log = (scores['player1'], scores['player2'], rounds['player1'], rounds['player2'])
             if current_score_log != last_score_log:
                 timestamp = frame_idx / fps
-                logger.log_score(frame_idx, timestamp, scores, rounds)
+                logger.log_score(frame_idx, timestamp, scores, rounds, score_detector.score_roi_obscured, score_detector.rounds_roi_obscured)
                 last_score_log = current_score_log
             score_detector.draw_scores(frame, rois)
             stats.record_phase('draw', time.perf_counter() - t0)
