@@ -32,6 +32,41 @@ from ultralytics import YOLO
 BALL_MODEL_PATH = "runs/detect/runs/ball_detector/weights/best.pt"
 DIGIT_MODEL_PATH = "runs/detect/runs/detect/digits_v2/weights/best.pt"
 
+
+def resolve_model_path(pt_path, require_engine=False):
+    """
+    Return the path to use for YOLO model loading. If a TensorRT .engine file
+    exists next to the .pt file, use it for faster inference (same API).
+    require_engine: if True, require the .engine to exist and return its path;
+                    use for --use-tensorrt (caller should check existence).
+    """
+    p = Path(pt_path)
+    if not p.is_absolute():
+        p = Path(__file__).resolve().parent / p
+    engine_path = p.with_suffix(".engine")
+    if require_engine:
+        return str(engine_path)
+    if engine_path.exists():
+        return str(engine_path)
+    return str(p)
+
+
+# -----------------------------------------------------------------------------
+# TensorRT export (one-time, on the same GPU you run inference on)
+# -----------------------------------------------------------------------------
+# Ball detector (match your --ball-inference-size, e.g. 640x360):
+#   from ultralytics import YOLO
+#   m = YOLO("runs/detect/runs/ball_detector/weights/best.pt")
+#   m.export(format="engine", imgsz=(360, 640), half=True, device=0, workspace=2)
+#
+# Digit/score model (runs on 320-size crops):
+#   m = YOLO("runs/detect/runs/detect/digits_v2/weights/best.pt")
+#   m.export(format="engine", imgsz=320, half=True, device=0, workspace=2)
+#
+# Engines are GPU-specific. Use the resulting .engine paths automatically
+# when present, or pass --use-tensorrt to require them.
+# -----------------------------------------------------------------------------
+
 # Detection settings
 BALL_CONF_THRESHOLD = 0.35
 DIGIT_CONF_THRESHOLD = 0.35
@@ -1252,7 +1287,7 @@ class RealtimeStats:
 # =============================================================================
 def main(video_path, output_dir="tracking_output", save_video=True,
          inference_size=None, benchmark_frames=0,
-         score_interval_sec=2.0, output_size=None):
+         score_interval_sec=2.0, output_size=None, use_tensorrt=False):
     """
     Main entry point for ball tracking and score detection.
 
@@ -1261,8 +1296,19 @@ def main(video_path, output_dir="tracking_output", save_video=True,
     score_interval_sec: seconds between score-detector runs (default 2.0).
     output_size:        (width, height) to downscale the saved output video,
                         or None to write at the original resolution.
+    use_tensorrt:       if True, require .engine models (fail if missing).
     """
     import time
+
+    # Resolve model paths (TensorRT .engine preferred when present)
+    ball_model_path = resolve_model_path(BALL_MODEL_PATH, require_engine=use_tensorrt)
+    digit_model_path = resolve_model_path(DIGIT_MODEL_PATH, require_engine=use_tensorrt)
+    if use_tensorrt:
+        for name, path in [("Ball", ball_model_path), ("Digit", digit_model_path)]:
+            if not Path(path).exists():
+                print(f"Error: --use-tensorrt set but {name} engine not found: {path}")
+                print("Export with: model.export(format='engine', imgsz=..., half=True, device=0)")
+                return
 
     print("\n" + "="*60)
     print("BALL TRACKING AND SCORE DETECTION SYSTEM")
@@ -1283,6 +1329,8 @@ def main(video_path, output_dir="tracking_output", save_video=True,
     print(f"Resolution: {frame_width}x{frame_height}")
     print(f"FPS: {fps}")
     print(f"Total frames: {total_frames}")
+    print(f"Ball model:   {ball_model_path}")
+    print(f"Digit model:  {digit_model_path}")
     if inference_size:
         print(f"Ball inference size: {inference_size[0]}x{inference_size[1]}")
     else:
@@ -1297,7 +1345,7 @@ def main(video_path, output_dir="tracking_output", save_video=True,
     # -------------------------------------------------------------------------
     if benchmark_frames > 0:
         _run_benchmark(cap, fps, frame_width, frame_height,
-                       inference_size, benchmark_frames)
+                       inference_size, benchmark_frames, ball_model_path)
         cap.release()
         return
 
@@ -1336,11 +1384,11 @@ def main(video_path, output_dir="tracking_output", save_video=True,
     # Initialize components
     print("\nLoading models...")
     print("  - Loading ball detection model...")
-    ball_tracker = BallTracker(BALL_MODEL_PATH, fps,
+    ball_tracker = BallTracker(ball_model_path, fps,
                                table_calibration=table_calibration,
                                inference_size=inference_size)
     print("  - Loading digit detection model...")
-    score_detector = ScoreDetector(DIGIT_MODEL_PATH)
+    score_detector = ScoreDetector(digit_model_path)
     logger = DataLogger(output_dir, with_meters=(table_calibration is not None and table_calibration.is_valid()))
     rally_aggregator = RallyAggregator(fps, logger, table_calibration)
     stats = RealtimeStats(fps)
@@ -1558,7 +1606,7 @@ def main(video_path, output_dir="tracking_output", save_video=True,
 
 def load_config_and_run(video_path, config_path, output_dir="tracking_output",
                         save_video=True, inference_size=None,
-                        score_interval_sec=2.0, output_size=None):
+                        score_interval_sec=2.0, output_size=None, use_tensorrt=False):
     """
     Run tracking with pre-saved ROI configuration (skip interactive setup).
     Useful for batch processing or re-running with same settings.
@@ -1567,8 +1615,19 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
     score_interval_sec: seconds between score-detector runs (default 2.0).
     output_size:        (width, height) to downscale the saved output video,
                         or None to write at the original resolution.
+    use_tensorrt:       if True, require .engine models (fail if missing).
     """
     import time
+
+    # Resolve model paths (TensorRT .engine preferred when present)
+    ball_model_path = resolve_model_path(BALL_MODEL_PATH, require_engine=use_tensorrt)
+    digit_model_path = resolve_model_path(DIGIT_MODEL_PATH, require_engine=use_tensorrt)
+    if use_tensorrt:
+        for name, path in [("Ball", ball_model_path), ("Digit", digit_model_path)]:
+            if not Path(path).exists():
+                print(f"Error: --use-tensorrt set but {name} engine not found: {path}")
+                print("Export with: model.export(format='engine', imgsz=..., half=True, device=0)")
+                return
 
     print("\n" + "="*60)
     print("BALL TRACKING - USING SAVED CONFIGURATION")
@@ -1617,15 +1676,17 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
         print(f"Output video size:   {output_size[0]}x{output_size[1]}")
     else:
         print(f"Output video size:   {frame_width}x{frame_height} (full resolution)")
+    print(f"Ball model:   {ball_model_path}")
+    print(f"Digit model:  {digit_model_path}")
 
     # Initialize components
     print("\nLoading models...")
     print("  - Loading ball detection model...")
-    ball_tracker = BallTracker(BALL_MODEL_PATH, fps,
+    ball_tracker = BallTracker(ball_model_path, fps,
                                table_calibration=table_calibration,
                                inference_size=inference_size)
     print("  - Loading digit detection model...")
-    score_detector = ScoreDetector(DIGIT_MODEL_PATH)
+    score_detector = ScoreDetector(digit_model_path)
     logger = DataLogger(output_dir, with_meters=(table_calibration is not None and table_calibration.is_valid()))
     rally_aggregator = RallyAggregator(fps, logger, table_calibration)
     stats = RealtimeStats(fps)
@@ -1791,22 +1852,28 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
 # =============================================================================
 # BENCHMARK HELPER
 # =============================================================================
-def _run_benchmark(cap, fps, frame_width, frame_height, inference_size, n_frames):
+def _run_benchmark(cap, fps, frame_width, frame_height, inference_size, n_frames,
+                  ball_model_path=None):
     """
     Headless benchmark: measure ball-inference FPS over n_frames frames.
     No display, no video writing, no score detection.
     Prints a concise summary on completion.
+    ball_model_path: path to ball model (.pt or .engine); default from resolve_model_path.
     """
     import time
+
+    if ball_model_path is None:
+        ball_model_path = resolve_model_path(BALL_MODEL_PATH, require_engine=False)
 
     inf_label = (f"{inference_size[0]}x{inference_size[1]}"
                  if inference_size else f"{frame_width}x{frame_height} (full)")
     print(f"\n{'='*60}")
     print(f"BENCHMARK MODE  —  inference size: {inf_label}")
+    print(f"Ball model: {ball_model_path}")
     print(f"Frames to process: {n_frames}")
     print(f"{'='*60}")
 
-    ball_tracker = BallTracker(BALL_MODEL_PATH, fps, inference_size=inference_size)
+    ball_tracker = BallTracker(ball_model_path, fps, inference_size=inference_size)
 
     # Warm-up (1 frame to load CUDA kernels / model cache)
     ret, frame = cap.read()
@@ -1894,6 +1961,9 @@ Examples:
   # Headless benchmark: measure ball-infer FPS at different resolutions
   python ball_tracking_analysis.py game_1.mp4 --benchmark 300
   python ball_tracking_analysis.py game_1.mp4 --benchmark 300 --ball-inference-size 640x360
+
+  # Use TensorRT engines (export .engine once; then use --use-tensorrt or rely on auto-detect)
+  python ball_tracking_analysis.py game_1.mp4 --use-tensorrt --ball-inference-size 640x360
         """
     )
     parser.add_argument("video", help="Path to input video file")
@@ -1936,6 +2006,14 @@ Examples:
             "Combine with --ball-inference-size to compare resolutions."
         )
     )
+    parser.add_argument(
+        "--use-tensorrt", action="store_true",
+        help=(
+            "Use TensorRT .engine models for inference (faster on NVIDIA GPU).  "
+            "Requires that you have exported .engine files next to the .pt weights.  "
+            "If omitted, .engine is used automatically when present."
+        )
+    )
 
     args = parser.parse_args()
 
@@ -1947,8 +2025,9 @@ Examples:
         load_config_and_run(args.video, args.config, args.output,
                             not args.no_video, inference_size=inf_size,
                             score_interval_sec=args.score_interval,
-                            output_size=out_size)
+                            output_size=out_size, use_tensorrt=args.use_tensorrt)
     else:
         main(args.video, args.output, not args.no_video,
              inference_size=inf_size, benchmark_frames=args.benchmark,
-             score_interval_sec=args.score_interval, output_size=out_size)
+             score_interval_sec=args.score_interval, output_size=out_size,
+             use_tensorrt=args.use_tensorrt)
