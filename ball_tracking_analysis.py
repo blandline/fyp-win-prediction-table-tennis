@@ -68,15 +68,23 @@ def resolve_model_path(pt_path, require_engine=False):
 # -----------------------------------------------------------------------------
 
 # Detection settings
-BALL_CONF_THRESHOLD = 0.35
+BALL_CONF_THRESHOLD = 0.40
 DIGIT_CONF_THRESHOLD = 0.35
 # Only update score when mean digit confidence >= this (avoids wrong reads when panel obscured)
-MIN_DIGIT_CONF_RELIABLE = 0.5
+MIN_DIGIT_CONF_RELIABLE = 0.55
+# A score is only accepted as a real change when it holds stable for this many consecutive
+# score-detector runs (each run is every score_interval_sec seconds).
+SCORE_STABLE_RUNS = 3
 
 # Tracker settings
 TRACKER_MAX_AGE = 5  # Frames to keep tracking without detection
 TRACKER_MIN_HITS = 2  # Minimum detections before track is valid
 TRACKER_IOU_THRESHOLD = 0.1  # IOU threshold for matching (lower for fast ball)
+
+# Rally boundaries: start when ball in play for N consecutive frames after score change;
+# end when ball out of play for M consecutive frames.
+RALLY_BALL_SEEN_FRAMES = 4    # Consecutive frames with ball to declare "rally started"
+RALLY_BALL_MISSING_FRAMES = 30  # Consecutive frames without ball to declare "rally ended"
 
 # Trajectory visualization
 TRAJECTORY_LENGTH = 50  # Number of points to show in trajectory
@@ -87,7 +95,7 @@ TABLE_LENGTH_M = 2.74
 TABLE_WIDTH_M = 1.525
 
 # Physical limits for filtering
-TABLE_MARGIN_M = 1.5  # accept ball positions up to this far outside the table
+TABLE_MARGIN_M = 3  # accept ball positions up to this far outside the table
 MAX_BALL_SPEED_MPS = 40.0  # world-record smash is ~32 m/s; generous cap
 
 # =============================================================================
@@ -745,6 +753,14 @@ class ScoreDetector:
             'player1': None,
             'player2': None
         }
+        # Stable scores: only updated after SCORE_STABLE_RUNS consecutive identical raw reads.
+        # Use this for rally boundary decisions to avoid acting on misreads.
+        self.stable_scores = {
+            'player1': None,
+            'player2': None
+        }
+        self._stable_candidate = {'player1': None, 'player2': None}
+        self._stable_run = {'player1': 0, 'player2': 0}
         self.rounds = {
             'player1': 0,
             'player2': 0
@@ -880,7 +896,10 @@ class ScoreDetector:
     def update_scores(self, frame, rois, frame_idx):
         """Update scores from detected digits. Only accepts readings when the score panel
         appears reliable (enough detections and confidence), to avoid wrong scores when obscured.
+        Also maintains stable_scores which only changes after SCORE_STABLE_RUNS consecutive
+        identical majority-voted readings, to avoid reacting to single-frame misreads.
         """
+        from collections import Counter
         for player, roi_key in [('player1', 'player1_score'), ('player2', 'player2_score')]:
             roi = rois.get(roi_key)
             if roi:
@@ -892,14 +911,25 @@ class ScoreDetector:
                 self.score_roi_obscured[player] = not reliable
                 if reliable and score is not None:
                     self.score_history[player].append(score)
-                    # Use majority voting for stability
+                    # Majority vote across recent history for current_scores (display)
                     if len(self.score_history[player]) >= 3:
-                        from collections import Counter
                         counts = Counter(self.score_history[player])
                         most_common = counts.most_common(1)[0]
                         if most_common[1] >= 2:  # At least 2 occurrences
-                            self.current_scores[player] = most_common[0]
-        
+                            voted = most_common[0]
+                            self.current_scores[player] = voted
+                            # Stable score: require SCORE_STABLE_RUNS identical consecutive votes
+                            if voted == self._stable_candidate[player]:
+                                self._stable_run[player] += 1
+                            else:
+                                self._stable_candidate[player] = voted
+                                self._stable_run[player] = 1
+                            if self._stable_run[player] >= SCORE_STABLE_RUNS:
+                                self.stable_scores[player] = voted
+                else:
+                    # Unreliable read: don't advance stable run
+                    self._stable_run[player] = 0
+
         self.last_processed_frame = frame_idx
         return self.current_scores
     
@@ -967,13 +997,23 @@ class ScoreDetector:
 
 
 # =============================================================================
-# RALLY AGGREGATION (SCORE-CHANGE TO SCORE-CHANGE)
+# RALLY AGGREGATION (ONE ROW PER POINT)
 # =============================================================================
 class RallyAggregator:
     """
-    Aggregates ball trajectory in meter space per rally (score change to score change).
-    Outputs one row per rally for the prediction module.
+    One CSV row per point (stable score change to stable score change).
+    Within a point, the ball being in play gates sample collection (trajectory data
+    is only recorded when the ball is seen for >= RALLY_BALL_SEEN_FRAMES consecutive frames
+    and stops when ball is missing for >= RALLY_BALL_MISSING_FRAMES consecutive frames).
+    Ball disappearing does NOT flush a row — only a confirmed stable score change does that.
+
+    States (for display only):
+      between_points : after a score change, waiting for ball to come into play
+      rally_active   : ball in play; collecting trajectory samples
     """
+    STATE_BETWEEN_POINTS = 'between_points'
+    STATE_RALLY_ACTIVE = 'rally_active'
+
     def __init__(self, fps, data_logger, table_calibration=None):
         self.fps = fps
         self.logger = data_logger
@@ -981,20 +1021,36 @@ class RallyAggregator:
         self.rally_id = 0
         self.rally_start_frame = 0
         self.rally_start_time = 0.0
-        self.rally_start_scores = (None, None)  # score at start of current rally
+        self.rally_start_scores = (None, None)
         self.rally_start_sets = (None, None)
-        self.samples = []  # list of (frame_idx, x_m, y_m, speed_mps)
-        self.last_scores = (None, None)  # (p1, p2) previous frame
+        self.samples = []
+        self.last_stable = (None, None)   # last confirmed stable (p1, p2)
         self.last_sets = (None, None)
-    
+        # Display state
+        self.state = self.STATE_BETWEEN_POINTS
+        self.ball_seen_consecutive = 0
+        self.ball_missing_consecutive = 0
+
+    def _ball_in_play(self, tracks_with_meters):
+        """True if ball is detected. With calibration, must be on/near table."""
+        if not tracks_with_meters:
+            return False
+        if not self.table_calibration or not self.table_calibration.is_valid():
+            return any(x_m is not None and y_m is not None
+                       for (_tid, x_m, y_m, _speed) in tracks_with_meters)
+        for (_tid, x_m, y_m, _speed) in tracks_with_meters:
+            if x_m is not None and y_m is not None and self._table_contains(x_m, y_m):
+                return True
+        return False
+
     def _table_contains(self, x_m, y_m):
-        """True if (x_m, y_m) is inside table plane (with small margin)."""
+        """True if (x_m, y_m) is inside table plane (with margin)."""
         if x_m is None or y_m is None:
             return False
         margin = 0.1
         return (-margin <= x_m <= TABLE_LENGTH_M + margin and
                 -margin <= y_m <= TABLE_WIDTH_M + margin)
-    
+
     def _landing_zone_index(self, x_m, y_m):
         """3x3 grid over table. Returns 0-8 or None if outside."""
         if not self._table_contains(x_m, y_m):
@@ -1004,49 +1060,91 @@ class RallyAggregator:
         col = min(2, int(x / (TABLE_LENGTH_M / 3)))
         row = min(2, int(y / (TABLE_WIDTH_M / 3)))
         return row * 3 + col
-    
-    def add_frame(self, frame_idx, timestamp_sec, tracks_with_meters, scores, rounds):
+
+    def get_state_for_display(self):
+        """Return rally state info for the overlay."""
+        return {
+            'state': self.state,
+            'rally_id': self.rally_id,
+            'ball_seen': self.ball_seen_consecutive,
+            'ball_missing': self.ball_missing_consecutive,
+        }
+
+    def add_frame(self, frame_idx, timestamp_sec, tracks_with_meters, stable_scores, rounds):
         """
-        Call each frame. tracks_with_meters: list of (track_id, x_m, y_m, speed_mps).
-        When score changes, flush current rally and start next.
+        Call each frame.
+        stable_scores: dict with 'player1'/'player2' from ScoreDetector.stable_scores
+                       (only changes after SCORE_STABLE_RUNS consistent reads).
+        tracks_with_meters: list of (track_id, x_m, y_m, speed_mps).
         """
-        p1, p2 = scores.get('player1'), scores.get('player2')
+        p1 = stable_scores.get('player1')
+        p2 = stable_scores.get('player2')
         r1, r2 = rounds.get('player1', 0), rounds.get('player2', 0)
-        current_scores = (p1, p2)
+        current_stable = (p1, p2)
         current_sets = (r1, r2)
-        
-        # First time we have scores: set rally start
-        if self.rally_start_scores[0] is None and p1 is not None and p2 is not None:
-            self.rally_start_scores = current_scores
+        ball_in_play = self._ball_in_play(tracks_with_meters)
+
+        # Bootstrap: first time we have a valid stable score pair
+        if self.last_stable[0] is None and p1 is not None and p2 is not None:
+            self.last_stable = current_stable
+            self.last_sets = current_sets
+            self.rally_start_scores = current_stable
             self.rally_start_sets = current_sets
-        
-        # Detect score change (point ended)
-        if self.last_scores[0] is not None and self.last_scores[1] is not None:
-            if (p1, p2) != self.last_scores:
-                # Flush previous rally: winner = whoever's score increased
-                if p1 != self.last_scores[0] and p2 == self.last_scores[1]:
-                    point_winner = 'p1'
-                elif p2 != self.last_scores[1] and p1 == self.last_scores[0]:
-                    point_winner = 'p2'
-                else:
-                    point_winner = 'unknown'
-                self._flush_rally(frame_idx, timestamp_sec, point_winner)
-                self.rally_id += 1
-                self.rally_start_frame = frame_idx
-                self.rally_start_time = timestamp_sec
-                self.rally_start_scores = current_scores
-                self.rally_start_sets = current_sets
-                self.samples = []
-        
-        self.last_scores = current_scores
+
+        # --- Stable score changed: point is over. Flush and start fresh. ---
+        if (self.last_stable[0] is not None and
+                current_stable[0] is not None and
+                current_stable != self.last_stable):
+            if p1 != self.last_stable[0] and p2 == self.last_stable[1]:
+                point_winner = 'p1'
+            elif p2 != self.last_stable[1] and p1 == self.last_stable[0]:
+                point_winner = 'p2'
+            else:
+                point_winner = 'unknown'
+            # Always flush (even if no samples) so every point gets a row
+            self._flush_rally(frame_idx, timestamp_sec, point_winner)
+            self.rally_id += 1
+            self.rally_start_frame = frame_idx
+            self.rally_start_time = timestamp_sec
+            self.rally_start_scores = current_stable
+            self.rally_start_sets = current_sets
+            self.samples = []
+            self.state = self.STATE_BETWEEN_POINTS
+            self.ball_seen_consecutive = 0
+            self.ball_missing_consecutive = 0
+
+        self.last_stable = current_stable
         self.last_sets = current_sets
-        
-        # Accumulate samples for current rally (only if we have meter-space data)
-        if self.table_calibration and self.table_calibration.is_valid() and tracks_with_meters:
-            for (track_id, x_m, y_m, speed_mps) in tracks_with_meters:
-                if x_m is not None and y_m is not None:
-                    self.samples.append((frame_idx, x_m, y_m, speed_mps or 0.0))
-    
+
+        # --- Within-point ball-gating (for display state and sample collection) ---
+        if self.state == self.STATE_BETWEEN_POINTS:
+            if ball_in_play:
+                self.ball_seen_consecutive += 1
+                self.ball_missing_consecutive = 0
+                if self.ball_seen_consecutive >= RALLY_BALL_SEEN_FRAMES:
+                    # Ball confirmed in play: mark rally active and start collecting
+                    self.state = self.STATE_RALLY_ACTIVE
+                    self.ball_seen_consecutive = 0
+            else:
+                self.ball_seen_consecutive = 0
+
+        elif self.state == self.STATE_RALLY_ACTIVE:
+            if ball_in_play:
+                self.ball_missing_consecutive = 0
+                # Accumulate samples
+                if self.table_calibration and self.table_calibration.is_valid() and tracks_with_meters:
+                    for (_tid, x_m, y_m, speed_mps) in tracks_with_meters:
+                        if x_m is not None and y_m is not None:
+                            self.samples.append((frame_idx, x_m, y_m, speed_mps or 0.0))
+            else:
+                self.ball_missing_consecutive += 1
+                if self.ball_missing_consecutive >= RALLY_BALL_MISSING_FRAMES:
+                    # Ball gone for too long within this point: pause collection
+                    # but do NOT flush — we stay in this point until score changes
+                    self.state = self.STATE_BETWEEN_POINTS
+                    self.ball_missing_consecutive = 0
+                    self.ball_seen_consecutive = 0
+
     def _flush_rally(self, end_frame, end_time, point_winner):
         """Write one rally row and reset buffer."""
         record = {
@@ -1083,8 +1181,8 @@ class RallyAggregator:
         self.logger.log_rally(record)
     
     def flush_final(self, end_frame, end_time):
-        """Call at end of video to write the last rally if any."""
-        if self.samples or self.last_scores[0] is not None:
+        """Call at end of video to flush the current point (if any stable scores recorded)."""
+        if self.last_stable[0] is not None:
             self._flush_rally(end_frame, end_time, 'unknown')
 
 
@@ -1205,6 +1303,7 @@ class RealtimeStats:
         self.t_score_infer = deque(maxlen=30)  # score YOLO (when it runs)
         self.t_draw = deque(maxlen=30)         # drawing overlays
         self.t_write = deque(maxlen=30)        # video writer
+        self.rally_display = None  # set by main loop from RallyAggregator.get_state_for_display()
 
     def update(self):
         import time
@@ -1239,9 +1338,9 @@ class RealtimeStats:
     def draw(self, frame, frame_idx, total_frames, paused, playback_speed):
         h, w = frame.shape[:2]
 
-        # Stats panel background (bottom-left) — extended for timing rows
+        # Stats panel background (bottom-left) — extended for timing rows + rally status
         overlay = frame.copy()
-        panel_h = 155
+        panel_h = 173
         cv2.rectangle(overlay, (10, h - panel_h - 10), (310, h - 10), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
 
@@ -1265,6 +1364,31 @@ class RealtimeStats:
         cv2.putText(frame, f"Ball: {ball_status}", (20, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, ball_color, 1)
         y += line_height
+
+        # Rally status (start/end by ball in play)
+        if self.rally_display:
+            rd = self.rally_display
+            state = rd.get('state', '')
+            rally_id = rd.get('rally_id', '')
+            if state == RallyAggregator.STATE_RALLY_ACTIVE:
+                label = f"Rally #{rally_id}: ACTIVE"
+                color = (0, 255, 0)
+            else:
+                seen = rd.get('ball_seen', 0)
+                need = RALLY_BALL_SEEN_FRAMES
+                label = f"Rally #{rally_id}: WAITING ({seen}/{need})"
+                color = (0, 220, 255)
+            cv2.putText(frame, label, (20, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            y += line_height
+            # Large banner near the top of the frame for easy visual check
+            banner_y = 50
+            banner_h = 36
+            overlay2 = frame.copy()
+            cv2.rectangle(overlay2, (0, banner_y - 28), (w, banner_y + banner_h - 28), (0, 0, 0), -1)
+            cv2.addWeighted(overlay2, 0.55, frame, 0.45, 0, frame)
+            cv2.putText(frame, label, (w // 2 - 160, banner_y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9, color, 2)
 
         # Speed (m/s when table calibrated, else px/s)
         if self.max_speed_mps is not None and self.max_speed_mps > 0:
@@ -1524,8 +1648,10 @@ def main(video_path, output_dir="tracking_output", save_video=True,
                 scores = score_detector.current_scores
                 rounds = score_detector.rounds
 
-            # Rally aggregation (per-frame; flushes on score change)
-            rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters, scores, rounds)
+            # Rally aggregation: driven by stable scores (debounced), not raw scores
+            rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters,
+                                       score_detector.stable_scores, rounds)
+            stats.rally_display = rally_aggregator.get_state_for_display()
 
             # Log if scores changed
             current_score_log = (scores['player1'], scores['player2'],
@@ -1795,7 +1921,9 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
                 scores = score_detector.current_scores
                 rounds = score_detector.rounds
 
-            rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters, scores, rounds)
+            rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters,
+                                       score_detector.stable_scores, rounds)
+            stats.rally_display = rally_aggregator.get_state_for_display()
 
             # Draw overlays (timed)
             t0 = time.perf_counter()
