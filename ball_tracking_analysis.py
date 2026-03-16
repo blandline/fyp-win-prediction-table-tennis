@@ -74,7 +74,7 @@ DIGIT_CONF_THRESHOLD = 0.35
 MIN_DIGIT_CONF_RELIABLE = 0.55
 # A score is only accepted as a real change when it holds stable for this many consecutive
 # score-detector runs (each run is every score_interval_sec seconds).
-SCORE_STABLE_RUNS = 3
+SCORE_STABLE_RUNS = 1
 
 # Tracker settings
 TRACKER_MAX_AGE = 5  # Frames to keep tracking without detection
