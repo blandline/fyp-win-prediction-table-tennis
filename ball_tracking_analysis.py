@@ -71,7 +71,7 @@ def resolve_model_path(pt_path, require_engine=False):
 BALL_CONF_THRESHOLD = 0.40
 DIGIT_CONF_THRESHOLD = 0.35
 # Only update score when mean digit confidence >= this (avoids wrong reads when panel obscured)
-MIN_DIGIT_CONF_RELIABLE = 0.55
+MIN_DIGIT_CONF_RELIABLE = 0.45
 # A score is only accepted as a real change when it holds stable for this many consecutive
 # score-detector runs (each run is every score_interval_sec seconds).
 SCORE_STABLE_RUNS = 1
