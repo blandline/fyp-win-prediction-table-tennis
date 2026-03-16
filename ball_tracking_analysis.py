@@ -9,6 +9,9 @@ This script provides:
    - Rounds won indicators for each player
 3. Ball trajectory tracking with speed calculation
 4. Real-time score detection using YOLO digit model
+5. MediaPipe Pose feature extraction (per-player, side-view optimised)
+   - Runs at ~10 FPS to minimise overhead
+   - Logs per-frame pose features to pose_frames_*.csv
 """
 
 import cv2
@@ -16,9 +19,27 @@ import numpy as np
 import json
 import sys
 import os
+import math
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+
+try:
+    import mediapipe as mp
+    # New Tasks API (mediapipe >= 0.10)
+    _mp_BaseOptions        = mp.tasks.BaseOptions
+    _mp_PoseLandmarker     = mp.tasks.vision.PoseLandmarker
+    _mp_PoseLandmarkerOpts = mp.tasks.vision.PoseLandmarkerOptions
+    _mp_VisionRunningMode  = mp.tasks.vision.RunningMode
+    _MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    _MEDIAPIPE_AVAILABLE = False
+    print("[WARNING] mediapipe not installed. Pose logging will be disabled.")
+    print("          Install with: pip install mediapipe")
+except AttributeError:
+    _MEDIAPIPE_AVAILABLE = False
+    print("[WARNING] mediapipe version too old or incompatible. Pose logging will be disabled.")
+    print("          Install with: pip install mediapipe")
 
 # Add sort directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'sort'))
@@ -1187,9 +1208,327 @@ class RallyAggregator:
 
 
 # =============================================================================
+# POSE FEATURE EXTRACTION
+# =============================================================================
+# Target pose FPS (frames per second at which pose is computed).
+# At 60 FPS video this means pose runs every 6th frame (~10 Hz).
+POSE_TARGET_FPS = 10.0
+
+# Minimum landmark visibility to trust a computed angle / position.
+POSE_MIN_VISIBILITY = 0.5
+
+# Minimum visibility for the dominant-arm wrist to report hand speed.
+POSE_HAND_MIN_VISIBILITY = 0.4
+
+# Path to the MediaPipe Pose Landmarker .task model file.
+# Download once with:
+#   python -c "import urllib.request; urllib.request.urlretrieve(
+#       'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task',
+#       'pose_landmarker_lite.task')"
+# Or use pose_landmarker_full.task / pose_landmarker_heavy.task for higher accuracy.
+POSE_MODEL_PATH = "pose_landmarker_lite.task"
+
+
+def _angle_between(a, b, c):
+    """
+    Return the angle at vertex B (degrees) formed by points A-B-C.
+    Each point is a (x, y) tuple.  Returns None if any coordinate is None.
+    """
+    if None in (a, b, c):
+        return None
+    ax, ay = a[0] - b[0], a[1] - b[1]
+    cx, cy = c[0] - b[0], c[1] - b[1]
+    dot = ax * cx + ay * cy
+    mag = math.hypot(ax, ay) * math.hypot(cx, cy)
+    if mag < 1e-9:
+        return None
+    cos_val = max(-1.0, min(1.0, dot / mag))
+    return math.degrees(math.acos(cos_val))
+
+
+def _vertical_angle(top, bottom):
+    """
+    Angle (degrees) between the vector top→bottom and the downward vertical.
+    Positive = leaning forward (toward camera-left in a side view).
+    Returns None if either point is None.
+    """
+    if top is None or bottom is None:
+        return None
+    dx = bottom[0] - top[0]
+    dy = bottom[1] - top[1]
+    if abs(dy) < 1e-9 and abs(dx) < 1e-9:
+        return None
+    return math.degrees(math.atan2(dx, dy))
+
+
+class PoseFeatureExtractor:
+    """
+    Wraps the MediaPipe Tasks PoseLandmarker (mediapipe >= 0.10) to extract a
+    compact, side-view-robust feature set per player per pose-frame.
+
+    Requires a .task model file (see POSE_MODEL_PATH constant).
+    Download once:
+        python -c "import urllib.request; urllib.request.urlretrieve(
+            'https://storage.googleapis.com/mediapipe-models/pose_landmarker/'
+            'pose_landmarker_lite/float16/latest/pose_landmarker_lite.task',
+            'pose_landmarker_lite.task')"
+
+    Player assignment (simple spatial split):
+      player_id=1 → left half of the frame
+      player_id=2 → right half of the frame
+
+    Features extracted (all normalised to image dimensions unless noted):
+      visibility_mean, visibility_min
+      angle_trunk_lean      – torso vs vertical (degrees)
+      angle_elbow_dom       – dominant-arm elbow flexion (degrees)
+      angle_knee_front      – front-leg knee flexion (degrees)
+      angle_knee_back       – back-leg knee flexion (degrees, empty if occluded)
+      com_height            – normalised COM height (0=bottom, 1=top of image)
+      hand_height           – normalised dominant-wrist height
+      stance_length         – normalised horizontal distance between ankles
+      v_hand_speed          – dominant-wrist 2D speed (normalised units / sec)
+      v_torso_x             – torso COM horizontal speed (normalised units / sec)
+      v_com_y               – vertical COM speed (normalised units / sec)
+    """
+
+    # MediaPipe PoseLandmarker landmark indices (same as classic API)
+    _LM = {
+        'nose': 0,
+        'left_shoulder': 11, 'right_shoulder': 12,
+        'left_elbow': 13,    'right_elbow': 14,
+        'left_wrist': 15,    'right_wrist': 16,
+        'left_hip': 23,      'right_hip': 24,
+        'left_knee': 25,     'right_knee': 26,
+        'left_ankle': 27,    'right_ankle': 28,
+        'left_index': 19,    'right_index': 20,
+    }
+
+    def __init__(self, fps):
+        self.fps = fps
+        self._landmarker = {}   # player_id → PoseLandmarker instance
+        self._prev = {}         # player_id → {'frame', 'hand', 'torso_x', 'com_y'}
+
+        if not _MEDIAPIPE_AVAILABLE:
+            return
+
+        model_path = Path(POSE_MODEL_PATH)
+        if not model_path.is_absolute():
+            model_path = Path(__file__).resolve().parent / model_path
+
+        if not model_path.exists():
+            print(f"[WARNING] Pose model not found: {model_path}")
+            print("  Download with:")
+            print("    python -c \"import urllib.request; urllib.request.urlretrieve(")
+            print("        'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task',")
+            print("        'pose_landmarker_lite.task')\"")
+            return
+
+        for pid in (1, 2):
+            opts = _mp_PoseLandmarkerOpts(
+                base_options=_mp_BaseOptions(model_asset_path=str(model_path)),
+                running_mode=_mp_VisionRunningMode.VIDEO,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+                output_segmentation_masks=False,
+            )
+            self._landmarker[pid] = _mp_PoseLandmarker.create_from_options(opts)
+
+    def close(self):
+        for lm in self._landmarker.values():
+            lm.close()
+
+    # ------------------------------------------------------------------
+    def update(self, frame_bgr, frame_idx, player_id, timestamp_sec):
+        """
+        Run pose on the player's half of the frame and return a feature dict.
+        Returns None if MediaPipe is unavailable, model missing, or no pose detected.
+        """
+        if not _MEDIAPIPE_AVAILABLE or player_id not in self._landmarker:
+            return None
+
+        h, w = frame_bgr.shape[:2]
+
+        # Crop to the player's half; track x-offset for global coords
+        if player_id == 1:
+            crop = frame_bgr[:, : w // 2]
+            x_offset = 0
+        else:
+            crop = frame_bgr[:, w // 2 :]
+            x_offset = w // 2
+
+        crop_h, crop_w = crop.shape[:2]
+
+        # Convert BGR → RGB, wrap in mp.Image
+        rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+        # VIDEO mode requires monotonically increasing timestamps in ms
+        timestamp_ms = int(timestamp_sec * 1000)
+        result = self._landmarker[player_id].detect_for_video(mp_image, timestamp_ms)
+
+        if not result.pose_landmarks or len(result.pose_landmarks) == 0:
+            return None
+
+        # result.pose_landmarks is a list of poses; take the first (num_poses=1)
+        lm = result.pose_landmarks[0]   # list of NormalizedLandmark
+
+        def _xy(name):
+            """Return (x_norm_full_frame, y_norm) or None if low visibility."""
+            idx = self._LM[name]
+            l = lm[idx]
+            if l.visibility < POSE_MIN_VISIBILITY:
+                return None
+            # x in crop → x in full frame (normalised to full width)
+            x_full = (l.x * crop_w + x_offset) / w
+            return (x_full, l.y)
+
+        def _vis(name):
+            return lm[self._LM[name]].visibility
+
+        # ---- Key points ------------------------------------------------
+        l_sh  = _xy('left_shoulder');  r_sh  = _xy('right_shoulder')
+        l_el  = _xy('left_elbow');     r_el  = _xy('right_elbow')
+        l_wr  = _xy('left_wrist');     r_wr  = _xy('right_wrist')
+        l_hip = _xy('left_hip');       r_hip = _xy('right_hip')
+        l_kn  = _xy('left_knee');      r_kn  = _xy('right_knee')
+        l_an  = _xy('left_ankle');     r_an  = _xy('right_ankle')
+
+        # ---- Visibility summary ----------------------------------------
+        key_names = [
+            'left_shoulder', 'right_shoulder',
+            'left_hip', 'right_hip',
+            'left_knee', 'right_knee',
+            'left_ankle', 'right_ankle',
+            'left_wrist', 'right_wrist',
+        ]
+        vis_vals = [_vis(n) for n in key_names]
+        visibility_mean = float(np.mean(vis_vals))
+        visibility_min  = float(np.min(vis_vals))
+
+        # ---- Trunk lean ------------------------------------------------
+        sh_center = (
+            ((l_sh[0] + r_sh[0]) / 2, (l_sh[1] + r_sh[1]) / 2)
+            if l_sh and r_sh else (l_sh or r_sh)
+        )
+        hip_center = (
+            ((l_hip[0] + r_hip[0]) / 2, (l_hip[1] + r_hip[1]) / 2)
+            if l_hip and r_hip else (l_hip or r_hip)
+        )
+        angle_trunk_lean = _vertical_angle(sh_center, hip_center)
+
+        # ---- Dominant arm (side view: use the arm with higher mean visibility) ----
+        left_arm_vis  = (_vis('left_shoulder')  + _vis('left_elbow')  + _vis('left_wrist'))  / 3
+        right_arm_vis = (_vis('right_shoulder') + _vis('right_elbow') + _vis('right_wrist')) / 3
+        if left_arm_vis >= right_arm_vis:
+            dom_sh, dom_el, dom_wr = l_sh, l_el, l_wr
+            dom_wrist_name = 'left_wrist'
+        else:
+            dom_sh, dom_el, dom_wr = r_sh, r_el, r_wr
+            dom_wrist_name = 'right_wrist'
+
+        angle_elbow_dom = _angle_between(dom_sh, dom_el, dom_wr)
+
+        # ---- Knee angles -----------------------------------------------
+        angle_knee_left  = _angle_between(l_hip, l_kn, l_an)
+        angle_knee_right = _angle_between(r_hip, r_kn, r_an)
+
+        # Front leg = ankle that is more forward (smaller x in side view)
+        if l_an and r_an:
+            if l_an[0] <= r_an[0]:
+                angle_knee_front, angle_knee_back = angle_knee_left, angle_knee_right
+            else:
+                angle_knee_front, angle_knee_back = angle_knee_right, angle_knee_left
+        else:
+            angle_knee_front = angle_knee_left or angle_knee_right
+            angle_knee_back  = None
+
+        # ---- COM height (normalised; 0=bottom, 1=top) ------------------
+        com_pts = [p for p in [l_sh, r_sh, l_hip, r_hip, l_kn, r_kn] if p is not None]
+        if com_pts:
+            com_y_norm = float(np.mean([p[1] for p in com_pts]))
+            com_height = 1.0 - com_y_norm   # flip: MediaPipe y=0 is top
+        else:
+            com_height = None
+
+        # ---- Hand height -----------------------------------------------
+        hand_lm = dom_wr
+        if hand_lm and _vis(dom_wrist_name) >= POSE_HAND_MIN_VISIBILITY:
+            hand_height = 1.0 - hand_lm[1]
+        else:
+            hand_height = None
+
+        # ---- Stance length (horizontal distance between ankles) --------
+        if l_an and r_an:
+            stance_length = abs(l_an[0] - r_an[0])
+        else:
+            stance_length = None
+
+        # ---- Velocities ------------------------------------------------
+        v_hand_speed = None
+        v_torso_x    = None
+        v_com_y      = None
+
+        prev = self._prev.get(player_id)
+        if prev is not None:
+            dt = (frame_idx - prev['frame']) / max(self.fps, 1.0)
+            if dt > 0:
+                if hand_lm and prev.get('hand') is not None:
+                    dx = hand_lm[0] - prev['hand'][0]
+                    dy = hand_lm[1] - prev['hand'][1]
+                    v_hand_speed = math.hypot(dx, dy) / dt
+
+                if hip_center and prev.get('torso_x') is not None:
+                    v_torso_x = (hip_center[0] - prev['torso_x']) / dt
+
+                if com_height is not None and prev.get('com_y') is not None:
+                    v_com_y = (com_height - prev['com_y']) / dt
+
+        # Update previous-frame state
+        self._prev[player_id] = {
+            'frame':   frame_idx,
+            'hand':    hand_lm,
+            'torso_x': hip_center[0] if hip_center else None,
+            'com_y':   com_height,
+        }
+
+        def _fmt(v, decimals=4):
+            return round(float(v), decimals) if v is not None else ''
+
+        return {
+            'frame':            frame_idx,
+            'timestamp_sec':    round(timestamp_sec, 4),
+            'player_id':        player_id,
+            'visibility_mean':  _fmt(visibility_mean),
+            'visibility_min':   _fmt(visibility_min),
+            'angle_trunk_lean': _fmt(angle_trunk_lean, 2),
+            'angle_elbow_dom':  _fmt(angle_elbow_dom, 2),
+            'angle_knee_front': _fmt(angle_knee_front, 2),
+            'angle_knee_back':  _fmt(angle_knee_back, 2),
+            'com_height':       _fmt(com_height),
+            'hand_height':      _fmt(hand_height),
+            'stance_length':    _fmt(stance_length),
+            'v_hand_speed':     _fmt(v_hand_speed),
+            'v_torso_x':        _fmt(v_torso_x),
+            'v_com_y':          _fmt(v_com_y),
+        }
+
+
+# =============================================================================
 # DATA LOGGING
 # =============================================================================
 class DataLogger:
+    # Ordered column names for the pose CSV (must match PoseFeatureExtractor output keys)
+    POSE_COLUMNS = [
+        'frame', 'timestamp_sec', 'player_id',
+        'visibility_mean', 'visibility_min',
+        'angle_trunk_lean', 'angle_elbow_dom',
+        'angle_knee_front', 'angle_knee_back',
+        'com_height', 'hand_height', 'stance_length',
+        'v_hand_speed', 'v_torso_x', 'v_com_y',
+    ]
+
     def __init__(self, output_dir, with_meters=False):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
@@ -1213,6 +1552,11 @@ class DataLogger:
         # Rally log (Stage 1: ball + score + placement)
         self.rally_file = self.output_dir / f"rallies_{timestamp}.csv"
         self._write_rally_header()
+
+        # Pose feature log (per-frame, per-player)
+        self.pose_file = self.output_dir / f"pose_frames_{timestamp}.csv"
+        with open(self.pose_file, 'w') as f:
+            f.write(','.join(self.POSE_COLUMNS) + '\n')
         
         # ROI config
         self.config_file = self.output_dir / f"config_{timestamp}.json"
@@ -1268,6 +1612,13 @@ class DataLogger:
             parts.append(record.get('point_winner', ''))
             f.write(','.join(str(p) for p in parts) + "\n")
     
+    def log_pose(self, record):
+        """Append one pose-feature row.  record must be the dict returned by
+        PoseFeatureExtractor.update() (keys matching POSE_COLUMNS)."""
+        with open(self.pose_file, 'a') as f:
+            parts = [str(record.get(col, '')) for col in self.POSE_COLUMNS]
+            f.write(','.join(parts) + '\n')
+
     def save_config(self, rois, video_path, fps, table_corners=None):
         config = {
             'video_path': str(video_path),
@@ -1301,6 +1652,7 @@ class RealtimeStats:
         # Per-phase timing (milliseconds, rolling 30-frame averages)
         self.t_ball_infer = deque(maxlen=30)   # ball YOLO inference + tracker
         self.t_score_infer = deque(maxlen=30)  # score YOLO (when it runs)
+        self.t_pose_infer = deque(maxlen=30)   # MediaPipe Pose (when it runs)
         self.t_draw = deque(maxlen=30)         # drawing overlays
         self.t_write = deque(maxlen=30)        # video writer
         self.rally_display = None  # set by main loop from RallyAggregator.get_state_for_display()
@@ -1321,6 +1673,8 @@ class RealtimeStats:
             self.t_ball_infer.append(ms)
         elif phase == 'score_infer':
             self.t_score_infer.append(ms)
+        elif phase == 'pose_infer':
+            self.t_pose_infer.append(ms)
         elif phase == 'draw':
             self.t_draw.append(ms)
         elif phase == 'write':
@@ -1338,10 +1692,10 @@ class RealtimeStats:
     def draw(self, frame, frame_idx, total_frames, paused, playback_speed):
         h, w = frame.shape[:2]
 
-        # Stats panel background (bottom-left) — extended for timing rows + rally status
+        # Stats panel background (bottom-left) — extended for timing rows + rally status + pose
         overlay = frame.copy()
-        panel_h = 173
-        cv2.rectangle(overlay, (10, h - panel_h - 10), (310, h - 10), (0, 0, 0), -1)
+        panel_h = 191
+        cv2.rectangle(overlay, (10, h - panel_h - 10), (340, h - 10), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
 
         y = h - panel_h + 5
@@ -1414,7 +1768,7 @@ class RealtimeStats:
         cv2.putText(frame, f"BallInfer: {_avg_ms(self.t_ball_infer)}ms  Score: {_avg_ms(self.t_score_infer)}ms",
                     (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (160, 200, 255), 1)
         y += line_height
-        cv2.putText(frame, f"Draw: {_avg_ms(self.t_draw)}ms  Write: {_avg_ms(self.t_write)}ms",
+        cv2.putText(frame, f"Pose: {_avg_ms(self.t_pose_infer)}ms  Draw: {_avg_ms(self.t_draw)}ms  Write: {_avg_ms(self.t_write)}ms",
                     (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (160, 200, 255), 1)
         y += line_height
 
@@ -1551,7 +1905,13 @@ def main(video_path, output_dir="tracking_output", save_video=True,
     logger = DataLogger(output_dir, with_meters=(table_calibration is not None and table_calibration.is_valid()))
     rally_aggregator = RallyAggregator(fps, logger, table_calibration)
     stats = RealtimeStats(fps)
+    print("  - Loading pose extractor...")
+    pose_extractor = PoseFeatureExtractor(fps)
     print("  - Models loaded!")
+    if _MEDIAPIPE_AVAILABLE:
+        print(f"  - Pose logging: ENABLED  (target {POSE_TARGET_FPS:.0f} FPS, file: {logger.pose_file.name})")
+    else:
+        print("  - Pose logging: DISABLED (mediapipe not installed)")
 
     # Save configuration
     logger.save_config(rois, video_path, fps, table_corners=table_corners)
@@ -1579,6 +1939,8 @@ def main(video_path, output_dir="tracking_output", save_video=True,
 
     # Score detection interval (configurable to reduce expensive YOLO calls)
     score_detect_interval = max(1, int(fps * score_interval_sec))
+    # Pose runs at POSE_TARGET_FPS regardless of video FPS
+    pose_interval = max(1, int(fps / POSE_TARGET_FPS))
     last_score_log = None
 
     print("\n" + "="*60)
@@ -1637,6 +1999,16 @@ def main(video_path, output_dir="tracking_output", save_video=True,
                 tracks_with_meters.append((track_id, x_m, y_m, speed_mps))
 
             stats.update_ball_stats(ball_detected, max_speed, max_speed_mps)
+
+            # Pose extraction (every pose_interval frames, timed)
+            if frame_idx % pose_interval == 0:
+                t0 = time.perf_counter()
+                ts = frame_idx / fps
+                for pid in (1, 2):
+                    feat = pose_extractor.update(frame, frame_idx, pid, ts)
+                    if feat is not None:
+                        logger.log_pose(feat)
+                stats.record_phase('pose_infer', time.perf_counter() - t0)
 
             # Score detection (every N frames for performance, timed)
             if frame_idx % score_detect_interval == 0:
@@ -1748,6 +2120,7 @@ def main(video_path, output_dir="tracking_output", save_video=True,
     
     # Cleanup
     score_detector.stop()  # Stop OCR thread
+    pose_extractor.close()
     cap.release()
     if video_writer:
         video_writer.release()
@@ -1759,6 +2132,7 @@ def main(video_path, output_dir="tracking_output", save_video=True,
     print(f"Trajectory log: {logger.trajectory_file}")
     print(f"Score log: {logger.score_file}")
     print(f"Rally log: {logger.rally_file}")
+    print(f"Pose log: {logger.pose_file}")
     print(f"Configuration: {logger.config_file}")
     if save_video and output_video_path:
         print(f"Output video: {output_video_path}")
@@ -1851,7 +2225,13 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
     logger = DataLogger(output_dir, with_meters=(table_calibration is not None and table_calibration.is_valid()))
     rally_aggregator = RallyAggregator(fps, logger, table_calibration)
     stats = RealtimeStats(fps)
+    print("  - Loading pose extractor...")
+    pose_extractor = PoseFeatureExtractor(fps)
     print("  - Models loaded!")
+    if _MEDIAPIPE_AVAILABLE:
+        print(f"  - Pose logging: ENABLED  (target {POSE_TARGET_FPS:.0f} FPS, file: {logger.pose_file.name})")
+    else:
+        print("  - Pose logging: DISABLED (mediapipe not installed)")
     logger.save_config(rois, video_path, fps, table_corners=table_corners)
 
     # Video writer (optionally downscaled)
@@ -1869,6 +2249,7 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
     cv2.resizeWindow("Ball Tracking - Real-Time", 1280, 720)
 
     score_detect_interval = max(1, int(fps * score_interval_sec))
+    pose_interval = max(1, int(fps / POSE_TARGET_FPS))
     last_score_log = None
     frame_idx = 0
     paused = False
@@ -1910,6 +2291,16 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
                 tracks_with_meters.append((track_id, x_m, y_m, speed_mps))
 
             stats.update_ball_stats(ball_detected, max_speed, max_speed_mps)
+
+            # Pose extraction (every pose_interval frames, timed)
+            if frame_idx % pose_interval == 0:
+                t0 = time.perf_counter()
+                ts = frame_idx / fps
+                for pid in (1, 2):
+                    feat = pose_extractor.update(frame, frame_idx, pid, ts)
+                    if feat is not None:
+                        logger.log_pose(feat)
+                stats.record_phase('pose_infer', time.perf_counter() - t0)
 
             # Score detection (every N frames, timed)
             if frame_idx % score_detect_interval == 0:
@@ -1996,6 +2387,7 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
 
     # Cleanup
     score_detector.stop()
+    pose_extractor.close()
     cap.release()
     if video_writer:
         video_writer.release()
@@ -2007,6 +2399,7 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
     print(f"Trajectory log: {logger.trajectory_file}")
     print(f"Score log: {logger.score_file}")
     print(f"Rally log: {logger.rally_file}")
+    print(f"Pose log: {logger.pose_file}")
     if output_video_path:
         print(f"Output video: {output_video_path}")
     print(f"Max ball speed: {stats.max_speed:.0f} px/s")

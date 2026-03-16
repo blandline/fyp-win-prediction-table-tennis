@@ -50,6 +50,10 @@ from ball_tracking_analysis import (
     RealtimeStats,
     interactive_frame_setup,
     _run_benchmark,
+    PoseFeatureExtractor,
+    POSE_TARGET_FPS,
+    POSE_MODEL_PATH,
+    _MEDIAPIPE_AVAILABLE,
 )
 
 # Unique sentinel object for end of stream (use identity check: `item is END_SENTINEL`)
@@ -423,8 +427,15 @@ def optimized_run(
     logger = DataLogger(output_dir, with_meters=(table_calibration is not None and table_calibration.is_valid()))
     rally_aggregator = RallyAggregator(fps, logger, table_calibration)
     stats = RealtimeStats(fps)
+    pose_extractor = PoseFeatureExtractor(fps)
     logger.save_config(rois, video_path, fps, table_corners=table_corners)
     print("  Models loaded!")
+    if _MEDIAPIPE_AVAILABLE:
+        print(f"  Pose logging: ENABLED  (target {POSE_TARGET_FPS:.0f} FPS, file: {logger.pose_file.name})")
+    else:
+        print("  Pose logging: DISABLED (mediapipe not installed)")
+
+    pose_interval = max(1, int(fps / POSE_TARGET_FPS))
 
     write_w = output_size[0] if output_size else frame_width
     write_h = output_size[1] if output_size else frame_height
@@ -515,6 +526,16 @@ def optimized_run(
 
             stats.update_ball_stats(ball_detected, max_speed, max_speed_mps)
 
+            # Pose extraction (every pose_interval frames, timed)
+            if frame_idx % pose_interval == 0:
+                t0 = time.perf_counter()
+                ts = frame_idx / fps
+                for pid in (1, 2):
+                    feat = pose_extractor.update(frame, frame_idx, pid, ts)
+                    if feat is not None:
+                        logger.log_pose(feat)
+                stats.record_phase('pose_infer', time.perf_counter() - t0)
+
             if frame_idx % score_detect_interval == 0:
                 t0 = time.perf_counter()
                 scores, rounds = score_detector.update_scores_and_rounds(frame, rois, frame_idx)
@@ -579,6 +600,7 @@ def optimized_run(
 
     finally:
         score_detector.stop()
+        pose_extractor.close()
         # Drain producer so it can exit (in case we broke out early)
         try:
             while True:
@@ -600,6 +622,7 @@ def optimized_run(
     print(f"Trajectory log: {logger.trajectory_file}")
     print(f"Score log: {logger.score_file}")
     print(f"Rally log: {logger.rally_file}")
+    print(f"Pose log: {logger.pose_file}")
     if save_video and output_video_path:
         print(f"Output video: {output_video_path}")
     print(f"Max ball speed recorded: {stats.max_speed:.0f} px/s")
