@@ -2025,6 +2025,8 @@ def main(video_path, output_dir="tracking_output", save_video=True,
     playback_speed = 1.0  # 1.0 = real-time
     frame_delay_base = 1.0 / fps  # Base delay between frames
     sides_swapped = False
+    prev_total_sets = None
+    last_auto_swap_frame = -9999
 
     while cap.isOpened():
         loop_start = time.time()
@@ -2083,6 +2085,18 @@ def main(video_path, output_dir="tracking_output", save_video=True,
             else:
                 scores = score_detector.current_scores
                 rounds = score_detector.rounds
+
+            # Auto side-swap: trigger when total completed sets increases
+            total_sets = rounds.get('player1', 0) + rounds.get('player2', 0)
+            if prev_total_sets is None:
+                prev_total_sets = total_sets
+            elif total_sets > prev_total_sets and frame_idx - last_auto_swap_frame > fps * 10:
+                sides_swapped = not sides_swapped
+                rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
+                rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
+                last_auto_swap_frame = frame_idx
+                prev_total_sets = total_sets
+                print(f"[Auto] Set {total_sets} detected — sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
 
             # Rally aggregation: driven by stable scores (debounced), not raw scores
             rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters,
@@ -2325,6 +2339,8 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
     playback_speed = 1.0
     frame_delay_base = 1.0 / fps
     sides_swapped = False
+    prev_total_sets = None
+    last_auto_swap_frame = -9999
 
     print("\nReal-time tracking started...")
     print("Controls: Q=Quit, P=Pause, +/-=Speed, S=Screenshot, </.>=Skip, X=SwapSides")
@@ -2381,6 +2397,18 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
             else:
                 scores = score_detector.current_scores
                 rounds = score_detector.rounds
+
+            # Auto side-swap: trigger when total completed sets increases
+            total_sets = rounds.get('player1', 0) + rounds.get('player2', 0)
+            if prev_total_sets is None:
+                prev_total_sets = total_sets
+            elif total_sets > prev_total_sets and frame_idx - last_auto_swap_frame > fps * 10:
+                sides_swapped = not sides_swapped
+                rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
+                rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
+                last_auto_swap_frame = frame_idx
+                prev_total_sets = total_sets
+                print(f"[Auto] Set {total_sets} detected — sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
 
             rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters,
                                        score_detector.stable_scores, rounds)

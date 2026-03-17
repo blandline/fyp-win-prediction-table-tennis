@@ -506,6 +506,8 @@ def optimized_run(
     frame_delay_base = 1.0 / fps if fps > 0 else 1.0 / 30.0
     last_displayed_frame = None  # for pause: redraw without consuming queue
     sides_swapped = False
+    prev_total_sets = None
+    last_auto_swap_frame = -9999
 
     print("\nOptimized tracking started. Q=Quit P=Pause +/-=Speed S=Screenshot X=SwapSides")
 
@@ -588,6 +590,18 @@ def optimized_run(
             else:
                 scores = score_detector.current_scores
                 rounds = score_detector.rounds
+
+            # Auto side-swap: trigger when total completed sets increases
+            total_sets = rounds.get('player1', 0) + rounds.get('player2', 0)
+            if prev_total_sets is None:
+                prev_total_sets = total_sets
+            elif total_sets > prev_total_sets and frame_idx - last_auto_swap_frame > fps * 10:
+                sides_swapped = not sides_swapped
+                rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
+                rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
+                last_auto_swap_frame = frame_idx
+                prev_total_sets = total_sets
+                print(f"[Auto] Set {total_sets} detected — sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
 
             rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters, score_detector.stable_scores, rounds)
             stats.rally_display = rally_aggregator.get_state_for_display()
