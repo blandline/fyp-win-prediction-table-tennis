@@ -90,12 +90,12 @@ def resolve_model_path(pt_path, require_engine=False):
 
 # Detection settings
 BALL_CONF_THRESHOLD = 0.40
-DIGIT_CONF_THRESHOLD = 0.35
-# Only update score when mean digit confidence >= this (avoids wrong reads when panel obscured)
+DIGIT_CONF_THRESHOLD = 0.45
+# Only update score when min digit confidence >= this (avoids wrong reads when panel obscured)
 MIN_DIGIT_CONF_RELIABLE = 0.45
 # A score is only accepted as a real change when it holds stable for this many consecutive
 # score-detector runs (each run is every score_interval_sec seconds).
-SCORE_STABLE_RUNS = 1
+SCORE_STABLE_RUNS = 4
 
 # Tracker settings
 TRACKER_MAX_AGE = 5  # Frames to keep tracking without detection
@@ -782,6 +782,8 @@ class ScoreDetector:
         }
         self._stable_candidate = {'player1': None, 'player2': None}
         self._stable_run = {'player1': 0, 'player2': 0}
+        self._rounds_candidate = {'player1': None, 'player2': None}
+        self._rounds_run = {'player1': 0, 'player2': 0}
         self.rounds = {
             'player1': 0,
             'player2': 0
@@ -842,7 +844,7 @@ class ScoreDetector:
         Returns dict with keys: score (int or None), num_detections (int), mean_conf (float).
         Used to avoid updating score when panel is obscured (0 or low-confidence detections).
         """
-        empty_result = {'score': None, 'num_detections': 0, 'mean_conf': 0.0}
+        empty_result = {'score': None, 'num_detections': 0, 'mean_conf': 0.0, 'min_conf': 0.0}
         if roi is None:
             return empty_result
         
@@ -908,7 +910,8 @@ class ScoreDetector:
                     continue
                 num_det = len(digits)
                 mean_conf = sum(d['conf'] for d in digits) / num_det
-                return {'score': score, 'num_detections': num_det, 'mean_conf': mean_conf}
+                min_conf = min(d['conf'] for d in digits)
+                return {'score': score, 'num_detections': num_det, 'mean_conf': mean_conf, 'min_conf': min_conf}
             except ValueError:
                 continue
         
@@ -927,8 +930,7 @@ class ScoreDetector:
                 result = self.detect_digits_in_roi(frame, roi)
                 score = result['score']
                 num_det = result['num_detections']
-                mean_conf = result['mean_conf']
-                reliable = (num_det >= 1 and mean_conf >= MIN_DIGIT_CONF_RELIABLE)
+                reliable = (num_det >= 1 and result['min_conf'] >= MIN_DIGIT_CONF_RELIABLE)
                 self.score_roi_obscured[player] = not reliable
                 if reliable and score is not None:
                     self.score_history[player].append(score)
@@ -964,11 +966,18 @@ class ScoreDetector:
                 result = self.detect_digits_in_roi(frame, roi)
                 rounds = result['score']
                 num_det = result['num_detections']
-                mean_conf = result['mean_conf']
-                reliable = (num_det >= 1 and mean_conf >= MIN_DIGIT_CONF_RELIABLE)
+                reliable = (num_det >= 1 and result['min_conf'] >= MIN_DIGIT_CONF_RELIABLE)
                 self.rounds_roi_obscured[player] = not reliable
                 if reliable and rounds is not None and rounds <= 5:  # Max 5 games in a match
-                    self.rounds[player] = rounds
+                    if rounds == self._rounds_candidate[player]:
+                        self._rounds_run[player] += 1
+                    else:
+                        self._rounds_candidate[player] = rounds
+                        self._rounds_run[player] = 1
+                    if self._rounds_run[player] >= SCORE_STABLE_RUNS:
+                        self.rounds[player] = rounds
+                else:
+                    self._rounds_run[player] = 0
         
         return self.rounds
     
@@ -2092,8 +2101,6 @@ def main(video_path, output_dir="tracking_output", save_video=True,
                 prev_total_sets = total_sets
             elif total_sets > prev_total_sets and frame_idx - last_auto_swap_frame > fps * 10:
                 sides_swapped = not sides_swapped
-                rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
-                rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
                 last_auto_swap_frame = frame_idx
                 prev_total_sets = total_sets
                 print(f"[Auto] Set {total_sets} detected — sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
@@ -2173,8 +2180,6 @@ def main(video_path, output_dir="tracking_output", save_video=True,
             print(f"Screenshot saved: {screenshot_path}")
         elif key == ord('x'):
             sides_swapped = not sides_swapped
-            rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
-            rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
             print(f"Sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
         elif key == ord('.') or key == ord('>'):
             # Skip forward 5 seconds
@@ -2404,8 +2409,6 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
                 prev_total_sets = total_sets
             elif total_sets > prev_total_sets and frame_idx - last_auto_swap_frame > fps * 10:
                 sides_swapped = not sides_swapped
-                rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
-                rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
                 last_auto_swap_frame = frame_idx
                 prev_total_sets = total_sets
                 print(f"[Auto] Set {total_sets} detected — sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
@@ -2469,8 +2472,6 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
             print(f"Screenshot saved: {screenshot_path}")
         elif key == ord('x'):
             sides_swapped = not sides_swapped
-            rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
-            rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
             print(f"Sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
         elif key == ord('.'):
             skip_frames = int(fps * 5)

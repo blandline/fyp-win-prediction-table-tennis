@@ -126,9 +126,9 @@ def _preprocess_for_detection(crop):
 
 
 def _parse_digit_result(boxes, conf_threshold=DIGIT_CONF_THRESHOLD, max_score=30):
-    """From one result's boxes, compute score (int or None), num_detections, mean_conf. Same logic as original."""
+    """From one result's boxes, compute score (int or None), num_detections, mean_conf, min_conf. Same logic as original."""
     if not boxes or len(boxes) == 0:
-        return None, 0, 0.0
+        return None, 0, 0.0, 0.0
     digits = []
     for box in boxes:
         bx1, by1, bx2, by2 = box.xyxy[0].tolist()
@@ -139,18 +139,19 @@ def _parse_digit_result(boxes, conf_threshold=DIGIT_CONF_THRESHOLD, max_score=30
         cx = (bx1 + bx2) / 2
         digits.append({'digit': str(cls), 'x': cx, 'conf': conf})
     if not digits:
-        return None, 0, 0.0
+        return None, 0, 0.0, 0.0
     digits.sort(key=lambda d: d['x'])
     score_str = ''.join(d['digit'] for d in digits[:2])
     try:
         score = int(score_str)
         if score > max_score:
-            return None, 0, 0.0
+            return None, 0, 0.0, 0.0
         num_det = len(digits)
         mean_conf = sum(d['conf'] for d in digits) / num_det
-        return score, num_det, mean_conf
+        min_conf = min(d['conf'] for d in digits)
+        return score, num_det, mean_conf, min_conf
     except ValueError:
-        return None, 0, 0.0
+        return None, 0, 0.0, 0.0
 
 
 # ROI keys in order: score then rounds (matches update_scores + detect_rounds)
@@ -174,6 +175,8 @@ class ScoreDetectorBatched:
         self.stable_scores = {'player1': None, 'player2': None}
         self._stable_candidate = {'player1': None, 'player2': None}
         self._stable_run = {'player1': 0, 'player2': 0}
+        self._rounds_candidate = {'player1': None, 'player2': None}
+        self._rounds_run = {'player1': 0, 'player2': 0}
         self.rounds = {'player1': 0, 'player2': 0}
         self.score_roi_obscured = {'player1': False, 'player2': False}
         self.rounds_roi_obscured = {'player1': False, 'player2': False}
@@ -245,17 +248,17 @@ class ScoreDetectorBatched:
         # Parse each result
         parsed = []
         for i, (player, roi_key, kind) in enumerate(roi_info):
-            score_val, num_det, mean_conf = None, 0, 0.0
+            score_val, num_det, mean_conf, min_conf = None, 0, 0.0, 0.0
             if i < len(results_list) and results_list[i] is not None:
                 boxes = results_list[i].boxes if hasattr(results_list[i], 'boxes') else []
-                score_val, num_det, mean_conf = _parse_digit_result(boxes, max_score=30)
-            parsed.append((player, roi_key, kind, score_val, num_det, mean_conf))
+                score_val, num_det, mean_conf, min_conf = _parse_digit_result(boxes, max_score=30)
+            parsed.append((player, roi_key, kind, score_val, num_det, min_conf))
 
         # Update score state (players 1 & 2 from first two ROIs)
-        for player, roi_key, kind, score_val, num_det, mean_conf in parsed:
+        for player, roi_key, kind, score_val, num_det, min_conf in parsed:
             if kind != 'score':
                 continue
-            reliable = (num_det >= 1 and mean_conf >= MIN_DIGIT_CONF_RELIABLE)
+            reliable = (num_det >= 1 and min_conf >= MIN_DIGIT_CONF_RELIABLE)
             self.score_roi_obscured[player] = not reliable
             if reliable and score_val is not None:
                 self.score_history[player].append(score_val)
@@ -276,13 +279,21 @@ class ScoreDetectorBatched:
                 self._stable_run[player] = 0
 
         # Update rounds (last two ROIs)
-        for player, roi_key, kind, score_val, num_det, mean_conf in parsed:
+        for player, roi_key, kind, score_val, num_det, min_conf in parsed:
             if kind != 'rounds':
                 continue
-            reliable = (num_det >= 1 and mean_conf >= MIN_DIGIT_CONF_RELIABLE)
+            reliable = (num_det >= 1 and min_conf >= MIN_DIGIT_CONF_RELIABLE)
             self.rounds_roi_obscured[player] = not reliable
             if reliable and score_val is not None and score_val <= 5:
-                self.rounds[player] = score_val
+                if score_val == self._rounds_candidate[player]:
+                    self._rounds_run[player] += 1
+                else:
+                    self._rounds_candidate[player] = score_val
+                    self._rounds_run[player] = 1
+                if self._rounds_run[player] >= SCORE_STABLE_RUNS:
+                    self.rounds[player] = score_val
+            else:
+                self._rounds_run[player] = 0
 
         self.last_processed_frame = frame_idx
         return self.current_scores, self.rounds
@@ -533,8 +544,6 @@ def optimized_run(
                     print(f"Screenshot saved: {screenshot_path}")
                 elif key == ord('x'):
                     sides_swapped = not sides_swapped
-                    rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
-                    rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
                     print(f"Sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
                 continue
 
@@ -597,8 +606,6 @@ def optimized_run(
                 prev_total_sets = total_sets
             elif total_sets > prev_total_sets and frame_idx - last_auto_swap_frame > fps * 10:
                 sides_swapped = not sides_swapped
-                rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
-                rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
                 last_auto_swap_frame = frame_idx
                 prev_total_sets = total_sets
                 print(f"[Auto] Set {total_sets} detected — sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
@@ -658,8 +665,6 @@ def optimized_run(
                 print(f"Screenshot saved: {screenshot_path}")
             elif key == ord('x'):
                 sides_swapped = not sides_swapped
-                rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
-                rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
                 print(f"Sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
 
     finally:
