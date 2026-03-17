@@ -183,7 +183,7 @@ class ScoreDetectorBatched:
         self.score_roi_obscured = {'player1': False, 'player2': False}
         self.rounds_roi_obscured = {'player1': False, 'player2': False}
         self.last_processed_frame = None
-        self._imgsz = 160
+        self._imgsz = 320
 
     def stop(self):
         pass
