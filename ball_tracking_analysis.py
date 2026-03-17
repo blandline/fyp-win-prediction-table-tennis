@@ -860,62 +860,51 @@ class ScoreDetector:
         if crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
             return empty_result
         
-        # Try with preprocessing first, then without if no result
-        images_to_try = []
-        
-        if use_preprocessing:
-            processed = self.preprocess_for_detection(crop)
-            if processed is not None:
-                images_to_try.append(processed)
-        
-        # Also try original image
-        images_to_try.append(crop)
-        
-        for img in images_to_try:
-            results = self.model(img, conf=DIGIT_CONF_THRESHOLD, imgsz=320, verbose=False)
-            
-            if not results or len(results[0].boxes) == 0:
-                continue
-            
+        def _parse_boxes(boxes):
+            """Parse YOLO boxes into a score result dict, or None if invalid."""
             digits = []
-            for box in results[0].boxes:
+            for box in boxes:
                 bx1, by1, bx2, by2 = box.xyxy[0].tolist()
                 cls = int(box.cls.item())
                 conf = box.conf.item()
-                
-                # Only accept digits 0-9
                 if cls < 0 or cls > 9:
                     continue
-                
                 cx = (bx1 + bx2) / 2
-                digits.append({
-                    'digit': str(cls),
-                    'x': cx,
-                    'conf': conf,
-                    'bbox': (bx1, by1, bx2, by2)
-                })
-            
+                digits.append({'digit': str(cls), 'x': cx, 'conf': conf, 'bbox': (bx1, by1, bx2, by2)})
             if not digits:
-                continue
-            
-            # Sort by x position (left to right)
+                return None
             digits.sort(key=lambda d: d['x'])
-            
-            # Combine digits (max 2 for score)
             score_str = ''.join(d['digit'] for d in digits[:2])
-            
             try:
                 score = int(score_str)
-                if score > 30:  # Invalid table tennis score
-                    continue
+                if score > 30:
+                    return None
                 num_det = len(digits)
-                mean_conf = sum(d['conf'] for d in digits) / num_det
-                min_conf = min(d['conf'] for d in digits)
-                return {'score': score, 'num_detections': num_det, 'mean_conf': mean_conf, 'min_conf': min_conf}
+                return {'score': score, 'num_detections': num_det,
+                        'mean_conf': sum(d['conf'] for d in digits) / num_det,
+                        'min_conf': min(d['conf'] for d in digits)}
             except ValueError:
-                continue
-        
-        return empty_result
+                return None
+
+        # Try preprocessed image first; only fall back to raw if preprocessing got 0 boxes
+        if use_preprocessing:
+            processed = self.preprocess_for_detection(crop)
+            if processed is not None:
+                results = self.model(processed, conf=DIGIT_CONF_THRESHOLD, imgsz=320, verbose=False)
+                if results and len(results[0].boxes) > 0:
+                    parsed = _parse_boxes(results[0].boxes)
+                    if parsed is not None:
+                        return parsed
+                    # boxes found but all invalid (score>30 etc.) — still return empty rather
+                    # than falling through to raw, to avoid double inference on bad frames
+                    return empty_result
+
+        # Fallback: raw crop (only reached when preprocessing disabled or got 0 boxes)
+        results = self.model(crop, conf=DIGIT_CONF_THRESHOLD, imgsz=320, verbose=False)
+        if not results or len(results[0].boxes) == 0:
+            return empty_result
+        parsed = _parse_boxes(results[0].boxes)
+        return parsed if parsed is not None else empty_result
     
     def update_scores(self, frame, rois, frame_idx):
         """Update scores from detected digits. Only accepts readings when the score panel
@@ -2034,8 +2023,6 @@ def main(video_path, output_dir="tracking_output", save_video=True,
     playback_speed = 1.0  # 1.0 = real-time
     frame_delay_base = 1.0 / fps  # Base delay between frames
     sides_swapped = False
-    prev_total_sets = None
-    last_auto_swap_frame = -9999
     score_freeze_until_frame = 0
 
     while cap.isOpened():
@@ -2095,19 +2082,6 @@ def main(video_path, output_dir="tracking_output", save_video=True,
             else:
                 scores = score_detector.current_scores
                 rounds = score_detector.rounds
-
-            # Auto side-swap: trigger when total completed sets increases
-            total_sets = rounds.get('player1', 0) + rounds.get('player2', 0)
-            if prev_total_sets is None:
-                prev_total_sets = total_sets
-            elif total_sets > prev_total_sets and frame_idx - last_auto_swap_frame > fps * 10:
-                sides_swapped = not sides_swapped
-                rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
-                rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
-                last_auto_swap_frame = frame_idx
-                prev_total_sets = total_sets
-                score_freeze_until_frame = frame_idx + int(fps * 8)
-                print(f"[Auto] Set {total_sets} detected — sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
 
             # Rally aggregation: driven by stable scores (debounced), not raw scores
             rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters,
@@ -2351,8 +2325,6 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
     playback_speed = 1.0
     frame_delay_base = 1.0 / fps
     sides_swapped = False
-    prev_total_sets = None
-    last_auto_swap_frame = -9999
     score_freeze_until_frame = 0
 
     print("\nReal-time tracking started...")
@@ -2410,19 +2382,6 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
             else:
                 scores = score_detector.current_scores
                 rounds = score_detector.rounds
-
-            # Auto side-swap: trigger when total completed sets increases
-            total_sets = rounds.get('player1', 0) + rounds.get('player2', 0)
-            if prev_total_sets is None:
-                prev_total_sets = total_sets
-            elif total_sets > prev_total_sets and frame_idx - last_auto_swap_frame > fps * 10:
-                sides_swapped = not sides_swapped
-                rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
-                rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
-                last_auto_swap_frame = frame_idx
-                prev_total_sets = total_sets
-                score_freeze_until_frame = frame_idx + int(fps * 8)
-                print(f"[Auto] Set {total_sets} detected — sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
 
             rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters,
                                        score_detector.stable_scores, rounds)
