@@ -329,6 +329,40 @@ class ScoreDetectorBatched:
 
 
 # =============================================================================
+# POSE SKELETON OVERLAY (debug)
+# =============================================================================
+def draw_pose_skeleton(frame, landmarks_px, color, thickness=2, joint_radius=4):
+    """
+    Draw a stick-figure skeleton on frame. landmarks_px: dict name -> (x, y) int.
+    Used for debugging pose tracking; can be removed or gated by a flag later.
+    """
+    if not landmarks_px:
+        return
+    # Connections: (start_name, end_name)
+    pairs = [
+        ('left_shoulder', 'right_shoulder'),
+        ('left_shoulder', 'left_elbow'),
+        ('left_elbow', 'left_wrist'),
+        ('right_shoulder', 'right_elbow'),
+        ('right_elbow', 'right_wrist'),
+        ('left_shoulder', 'left_hip'),
+        ('right_shoulder', 'right_hip'),
+        ('left_hip', 'right_hip'),
+        ('left_hip', 'left_knee'),
+        ('left_knee', 'left_ankle'),
+        ('right_hip', 'right_knee'),
+        ('right_knee', 'right_ankle'),
+    ]
+    for a, b in pairs:
+        if a in landmarks_px and b in landmarks_px:
+            pt1 = tuple(landmarks_px[a])
+            pt2 = tuple(landmarks_px[b])
+            cv2.line(frame, pt1, pt2, color, thickness)
+    for name, pt in landmarks_px.items():
+        cv2.circle(frame, tuple(pt), joint_radius, color, -1)
+
+
+# =============================================================================
 # CONFIG LOADING (no dependency on original's load_config_and_run)
 # =============================================================================
 def load_config(config_path):
@@ -534,6 +568,11 @@ def optimized_run(
                     feat = pose_extractor.update(frame, frame_idx, pid, ts)
                     if feat is not None:
                         logger.log_pose(feat)
+                        # Debug: draw skeleton overlay (P1=green, P2=blue)
+                        lm_px = feat.get('debug_landmarks')
+                        if lm_px:
+                            color = (0, 255, 0) if pid == 1 else (255, 0, 0)  # BGR
+                            draw_pose_skeleton(frame, lm_px, color)
                 stats.record_phase('pose_infer', time.perf_counter() - t0)
 
             if frame_idx % score_detect_interval == 0:

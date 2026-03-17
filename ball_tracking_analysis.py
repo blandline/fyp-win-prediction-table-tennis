@@ -1384,6 +1384,13 @@ class PoseFeatureExtractor:
             x_full = (l.x * crop_w + x_offset) / w
             return (x_full, l.y)
 
+        def _xy_raw(name):
+            """Return (x_norm_full_frame, y_norm) regardless of visibility."""
+            idx = self._LM[name]
+            l = lm[idx]
+            x_full = (l.x * crop_w + x_offset) / w
+            return (x_full, l.y)
+
         def _vis(name):
             return lm[self._LM[name]].visibility
 
@@ -1418,9 +1425,19 @@ class PoseFeatureExtractor:
         )
         angle_trunk_lean = _vertical_angle(sh_center, hip_center)
 
-        # ---- Dominant arm (side view: use the arm with higher mean visibility) ----
+        # ---- Per-arm visibility (always computed) ------------------------------
         left_arm_vis  = (_vis('left_shoulder')  + _vis('left_elbow')  + _vis('left_wrist'))  / 3
         right_arm_vis = (_vis('right_shoulder') + _vis('right_elbow') + _vis('right_wrist')) / 3
+
+        # ---- Both arm elbow angles (raw coords, no visibility gate) -----------
+        l_sh_raw = _xy_raw('left_shoulder');  r_sh_raw = _xy_raw('right_shoulder')
+        l_el_raw = _xy_raw('left_elbow');     r_el_raw = _xy_raw('right_elbow')
+        l_wr_raw = _xy_raw('left_wrist');     r_wr_raw = _xy_raw('right_wrist')
+
+        angle_elbow_left  = _angle_between(l_sh_raw, l_el_raw, l_wr_raw)
+        angle_elbow_right = _angle_between(r_sh_raw, r_el_raw, r_wr_raw)
+
+        # ---- Dominant arm (kept for backwards compat) -------------------------
         if left_arm_vis >= right_arm_vis:
             dom_sh, dom_el, dom_wr = l_sh, l_el, l_wr
             dom_wrist_name = 'left_wrist'
@@ -1452,12 +1469,16 @@ class PoseFeatureExtractor:
         else:
             com_height = None
 
-        # ---- Hand height -----------------------------------------------
+        # ---- Hand height (dominant, kept for backwards compat) ----------------
         hand_lm = dom_wr
         if hand_lm and _vis(dom_wrist_name) >= POSE_HAND_MIN_VISIBILITY:
             hand_height = 1.0 - hand_lm[1]
         else:
             hand_height = None
+
+        # ---- Per-arm hand height (raw, no visibility gate) --------------------
+        hand_height_left  = 1.0 - l_wr_raw[1]
+        hand_height_right = 1.0 - r_wr_raw[1]
 
         # ---- Stance length (horizontal distance between ankles) --------
         if l_an and r_an:
@@ -1466,9 +1487,11 @@ class PoseFeatureExtractor:
             stance_length = None
 
         # ---- Velocities ------------------------------------------------
-        v_hand_speed = None
-        v_torso_x    = None
-        v_com_y      = None
+        v_hand_speed       = None
+        v_torso_x          = None
+        v_com_y            = None
+        v_hand_speed_left  = None
+        v_hand_speed_right = None
 
         prev = self._prev.get(player_id)
         if prev is not None:
@@ -1479,6 +1502,16 @@ class PoseFeatureExtractor:
                     dy = hand_lm[1] - prev['hand'][1]
                     v_hand_speed = math.hypot(dx, dy) / dt
 
+                if prev.get('hand_left') is not None:
+                    dx = l_wr_raw[0] - prev['hand_left'][0]
+                    dy = l_wr_raw[1] - prev['hand_left'][1]
+                    v_hand_speed_left = math.hypot(dx, dy) / dt
+
+                if prev.get('hand_right') is not None:
+                    dx = r_wr_raw[0] - prev['hand_right'][0]
+                    dy = r_wr_raw[1] - prev['hand_right'][1]
+                    v_hand_speed_right = math.hypot(dx, dy) / dt
+
                 if hip_center and prev.get('torso_x') is not None:
                     v_torso_x = (hip_center[0] - prev['torso_x']) / dt
 
@@ -1487,31 +1520,55 @@ class PoseFeatureExtractor:
 
         # Update previous-frame state
         self._prev[player_id] = {
-            'frame':   frame_idx,
-            'hand':    hand_lm,
-            'torso_x': hip_center[0] if hip_center else None,
-            'com_y':   com_height,
+            'frame':      frame_idx,
+            'hand':       hand_lm,
+            'hand_left':  l_wr_raw,
+            'hand_right': r_wr_raw,
+            'torso_x':    hip_center[0] if hip_center else None,
+            'com_y':      com_height,
         }
 
         def _fmt(v, decimals=4):
             return round(float(v), decimals) if v is not None else ''
 
+        # Debug overlay: pixel coords for skeleton (name -> (x_px, y_px)); not written to CSV
+        debug_landmarks = {}
+        for name, pt in [
+            ('left_shoulder', l_sh), ('right_shoulder', r_sh),
+            ('left_elbow', l_el), ('right_elbow', r_el),
+            ('left_wrist', l_wr), ('right_wrist', r_wr),
+            ('left_hip', l_hip), ('right_hip', r_hip),
+            ('left_knee', l_kn), ('right_knee', r_kn),
+            ('left_ankle', l_an), ('right_ankle', r_an),
+        ]:
+            if pt is not None:
+                debug_landmarks[name] = (int(pt[0] * w), int(pt[1] * h))
+
         return {
-            'frame':            frame_idx,
-            'timestamp_sec':    round(timestamp_sec, 4),
-            'player_id':        player_id,
-            'visibility_mean':  _fmt(visibility_mean),
-            'visibility_min':   _fmt(visibility_min),
-            'angle_trunk_lean': _fmt(angle_trunk_lean, 2),
-            'angle_elbow_dom':  _fmt(angle_elbow_dom, 2),
-            'angle_knee_front': _fmt(angle_knee_front, 2),
-            'angle_knee_back':  _fmt(angle_knee_back, 2),
-            'com_height':       _fmt(com_height),
-            'hand_height':      _fmt(hand_height),
-            'stance_length':    _fmt(stance_length),
-            'v_hand_speed':     _fmt(v_hand_speed),
-            'v_torso_x':        _fmt(v_torso_x),
-            'v_com_y':          _fmt(v_com_y),
+            'frame':               frame_idx,
+            'timestamp_sec':       round(timestamp_sec, 4),
+            'player_id':           player_id,
+            'visibility_mean':     _fmt(visibility_mean),
+            'visibility_min':      _fmt(visibility_min),
+            'visibility_left_arm': _fmt(left_arm_vis),
+            'visibility_right_arm':_fmt(right_arm_vis),
+            'angle_trunk_lean':    _fmt(angle_trunk_lean, 2),
+            'angle_elbow_dom':     _fmt(angle_elbow_dom, 2),
+            'angle_elbow_left':    _fmt(angle_elbow_left, 2),
+            'angle_elbow_right':   _fmt(angle_elbow_right, 2),
+            'angle_knee_front':    _fmt(angle_knee_front, 2),
+            'angle_knee_back':     _fmt(angle_knee_back, 2),
+            'com_height':          _fmt(com_height),
+            'hand_height':         _fmt(hand_height),
+            'hand_height_left':    _fmt(hand_height_left),
+            'hand_height_right':   _fmt(hand_height_right),
+            'stance_length':       _fmt(stance_length),
+            'v_hand_speed':        _fmt(v_hand_speed),
+            'v_hand_speed_left':   _fmt(v_hand_speed_left),
+            'v_hand_speed_right':  _fmt(v_hand_speed_right),
+            'v_torso_x':           _fmt(v_torso_x),
+            'v_com_y':             _fmt(v_com_y),
+            'debug_landmarks':     debug_landmarks,
         }
 
 
@@ -1523,10 +1580,15 @@ class DataLogger:
     POSE_COLUMNS = [
         'frame', 'timestamp_sec', 'player_id',
         'visibility_mean', 'visibility_min',
+        'visibility_left_arm', 'visibility_right_arm',
         'angle_trunk_lean', 'angle_elbow_dom',
+        'angle_elbow_left', 'angle_elbow_right',
         'angle_knee_front', 'angle_knee_back',
-        'com_height', 'hand_height', 'stance_length',
-        'v_hand_speed', 'v_torso_x', 'v_com_y',
+        'com_height', 'hand_height',
+        'hand_height_left', 'hand_height_right',
+        'stance_length',
+        'v_hand_speed', 'v_hand_speed_left', 'v_hand_speed_right',
+        'v_torso_x', 'v_com_y',
     ]
 
     def __init__(self, output_dir, with_meters=False):
