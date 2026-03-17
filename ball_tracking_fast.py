@@ -505,8 +505,9 @@ def optimized_run(
     playback_speed = 1.0
     frame_delay_base = 1.0 / fps if fps > 0 else 1.0 / 30.0
     last_displayed_frame = None  # for pause: redraw without consuming queue
+    sides_swapped = False
 
-    print("\nOptimized tracking started. Q=Quit P=Pause +/-=Speed S=Screenshot")
+    print("\nOptimized tracking started. Q=Quit P=Pause +/-=Speed S=Screenshot X=SwapSides")
 
     try:
         while True:
@@ -528,6 +529,11 @@ def optimized_run(
                     if last_displayed_frame is not None:
                         cv2.imwrite(str(screenshot_path), last_displayed_frame)
                     print(f"Screenshot saved: {screenshot_path}")
+                elif key == ord('x'):
+                    sides_swapped = not sides_swapped
+                    rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
+                    rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
+                    print(f"Sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
                 continue
 
             # Get next frame from producer (blocking)
@@ -565,7 +571,7 @@ def optimized_run(
                 t0 = time.perf_counter()
                 ts = frame_idx / fps
                 for pid in (1, 2):
-                    feat = pose_extractor.update(frame, frame_idx, pid, ts)
+                    feat = pose_extractor.update(frame, frame_idx, pid, ts, sides_swapped=sides_swapped)
                     if feat is not None:
                         logger.log_pose(feat)
                         # Debug: draw skeleton overlay (P1=green, P2=blue)
@@ -636,6 +642,11 @@ def optimized_run(
                 screenshot_path = Path(output_dir) / f"screenshot_{frame_idx}.jpg"
                 cv2.imwrite(str(screenshot_path), frame)
                 print(f"Screenshot saved: {screenshot_path}")
+            elif key == ord('x'):
+                sides_swapped = not sides_swapped
+                rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
+                rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
+                print(f"Sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
 
     finally:
         score_detector.stop()

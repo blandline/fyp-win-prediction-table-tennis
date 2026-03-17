@@ -1340,7 +1340,7 @@ class PoseFeatureExtractor:
             lm.close()
 
     # ------------------------------------------------------------------
-    def update(self, frame_bgr, frame_idx, player_id, timestamp_sec):
+    def update(self, frame_bgr, frame_idx, player_id, timestamp_sec, sides_swapped=False):
         """
         Run pose on the player's half of the frame and return a feature dict.
         Returns None if MediaPipe is unavailable, model missing, or no pose detected.
@@ -1351,7 +1351,8 @@ class PoseFeatureExtractor:
         h, w = frame_bgr.shape[:2]
 
         # Crop to the player's half; track x-offset for global coords
-        if player_id == 1:
+        p1_on_left = not sides_swapped
+        if (player_id == 1) == p1_on_left:
             crop = frame_bgr[:, : w // 2]
             x_offset = 0
         else:
@@ -1853,8 +1854,8 @@ class RealtimeStats:
                         cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
 
         # Controls hint (top-right)
-        cv2.putText(frame, "Q:Quit P:Pause +/-:Speed S:Screenshot",
-                    (w - 350, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+        cv2.putText(frame, "Q:Quit P:Pause +/-:Speed S:Screenshot X:SwapSides",
+                    (w - 420, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
 
 # =============================================================================
@@ -2023,6 +2024,7 @@ def main(video_path, output_dir="tracking_output", save_video=True,
     paused = False
     playback_speed = 1.0  # 1.0 = real-time
     frame_delay_base = 1.0 / fps  # Base delay between frames
+    sides_swapped = False
 
     while cap.isOpened():
         loop_start = time.time()
@@ -2067,7 +2069,7 @@ def main(video_path, output_dir="tracking_output", save_video=True,
                 t0 = time.perf_counter()
                 ts = frame_idx / fps
                 for pid in (1, 2):
-                    feat = pose_extractor.update(frame, frame_idx, pid, ts)
+                    feat = pose_extractor.update(frame, frame_idx, pid, ts, sides_swapped=sides_swapped)
                     if feat is not None:
                         logger.log_pose(feat)
                 stats.record_phase('pose_infer', time.perf_counter() - t0)
@@ -2155,6 +2157,11 @@ def main(video_path, output_dir="tracking_output", save_video=True,
             screenshot_path = Path(output_dir) / f"screenshot_{frame_idx}.jpg"
             cv2.imwrite(str(screenshot_path), frame)
             print(f"Screenshot saved: {screenshot_path}")
+        elif key == ord('x'):
+            sides_swapped = not sides_swapped
+            rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
+            rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
+            print(f"Sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
         elif key == ord('.') or key == ord('>'):
             # Skip forward 5 seconds
             skip_frames = int(fps * 5)
@@ -2317,9 +2324,10 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
     paused = False
     playback_speed = 1.0
     frame_delay_base = 1.0 / fps
+    sides_swapped = False
 
     print("\nReal-time tracking started...")
-    print("Controls: Q=Quit, P=Pause, +/-=Speed, S=Screenshot, </.>=Skip")
+    print("Controls: Q=Quit, P=Pause, +/-=Speed, S=Screenshot, </.>=Skip, X=SwapSides")
 
     while cap.isOpened():
         loop_start = time.time()
@@ -2359,7 +2367,7 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
                 t0 = time.perf_counter()
                 ts = frame_idx / fps
                 for pid in (1, 2):
-                    feat = pose_extractor.update(frame, frame_idx, pid, ts)
+                    feat = pose_extractor.update(frame, frame_idx, pid, ts, sides_swapped=sides_swapped)
                     if feat is not None:
                         logger.log_pose(feat)
                 stats.record_phase('pose_infer', time.perf_counter() - t0)
@@ -2431,6 +2439,11 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
             screenshot_path = Path(output_dir) / f"screenshot_{frame_idx}.jpg"
             cv2.imwrite(str(screenshot_path), frame)
             print(f"Screenshot saved: {screenshot_path}")
+        elif key == ord('x'):
+            sides_swapped = not sides_swapped
+            rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
+            rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
+            print(f"Sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
         elif key == ord('.'):
             skip_frames = int(fps * 5)
             new_pos = min(frame_idx + skip_frames, total_frames - 1)
