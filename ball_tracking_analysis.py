@@ -90,7 +90,7 @@ def resolve_model_path(pt_path, require_engine=False):
 
 # Detection settings
 BALL_CONF_THRESHOLD = 0.40
-DIGIT_CONF_THRESHOLD = 0.45
+DIGIT_CONF_THRESHOLD = 0.35
 # Only update score when min digit confidence >= this (avoids wrong reads when panel obscured)
 MIN_DIGIT_CONF_RELIABLE = 0.45
 # A score is only accepted as a real change when it holds stable for this many consecutive
@@ -2036,6 +2036,7 @@ def main(video_path, output_dir="tracking_output", save_video=True,
     sides_swapped = False
     prev_total_sets = None
     last_auto_swap_frame = -9999
+    score_freeze_until_frame = 0
 
     while cap.isOpened():
         loop_start = time.time()
@@ -2086,7 +2087,7 @@ def main(video_path, output_dir="tracking_output", save_video=True,
                 stats.record_phase('pose_infer', time.perf_counter() - t0)
 
             # Score detection (every N frames for performance, timed)
-            if frame_idx % score_detect_interval == 0:
+            if frame_idx % score_detect_interval == 0 and frame_idx >= score_freeze_until_frame:
                 t0 = time.perf_counter()
                 scores = score_detector.update_scores(frame, rois, frame_idx)
                 rounds = score_detector.detect_rounds(frame, rois)
@@ -2101,8 +2102,11 @@ def main(video_path, output_dir="tracking_output", save_video=True,
                 prev_total_sets = total_sets
             elif total_sets > prev_total_sets and frame_idx - last_auto_swap_frame > fps * 10:
                 sides_swapped = not sides_swapped
+                rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
+                rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
                 last_auto_swap_frame = frame_idx
                 prev_total_sets = total_sets
+                score_freeze_until_frame = frame_idx + int(fps * 8)
                 print(f"[Auto] Set {total_sets} detected — sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
 
             # Rally aggregation: driven by stable scores (debounced), not raw scores
@@ -2180,6 +2184,9 @@ def main(video_path, output_dir="tracking_output", save_video=True,
             print(f"Screenshot saved: {screenshot_path}")
         elif key == ord('x'):
             sides_swapped = not sides_swapped
+            rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
+            rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
+            score_freeze_until_frame = frame_idx + int(fps * 8)
             print(f"Sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
         elif key == ord('.') or key == ord('>'):
             # Skip forward 5 seconds
@@ -2346,6 +2353,7 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
     sides_swapped = False
     prev_total_sets = None
     last_auto_swap_frame = -9999
+    score_freeze_until_frame = 0
 
     print("\nReal-time tracking started...")
     print("Controls: Q=Quit, P=Pause, +/-=Speed, S=Screenshot, </.>=Skip, X=SwapSides")
@@ -2394,7 +2402,7 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
                 stats.record_phase('pose_infer', time.perf_counter() - t0)
 
             # Score detection (every N frames, timed)
-            if frame_idx % score_detect_interval == 0:
+            if frame_idx % score_detect_interval == 0 and frame_idx >= score_freeze_until_frame:
                 t0 = time.perf_counter()
                 scores = score_detector.update_scores(frame, rois, frame_idx)
                 rounds = score_detector.detect_rounds(frame, rois)
@@ -2409,8 +2417,11 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
                 prev_total_sets = total_sets
             elif total_sets > prev_total_sets and frame_idx - last_auto_swap_frame > fps * 10:
                 sides_swapped = not sides_swapped
+                rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
+                rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
                 last_auto_swap_frame = frame_idx
                 prev_total_sets = total_sets
+                score_freeze_until_frame = frame_idx + int(fps * 8)
                 print(f"[Auto] Set {total_sets} detected — sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
 
             rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters,
@@ -2472,6 +2483,9 @@ def load_config_and_run(video_path, config_path, output_dir="tracking_output",
             print(f"Screenshot saved: {screenshot_path}")
         elif key == ord('x'):
             sides_swapped = not sides_swapped
+            rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
+            rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
+            score_freeze_until_frame = frame_idx + int(fps * 8)
             print(f"Sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
         elif key == ord('.'):
             skip_frames = int(fps * 5)

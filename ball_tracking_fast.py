@@ -519,6 +519,7 @@ def optimized_run(
     sides_swapped = False
     prev_total_sets = None
     last_auto_swap_frame = -9999
+    score_freeze_until_frame = 0
 
     print("\nOptimized tracking started. Q=Quit P=Pause +/-=Speed S=Screenshot X=SwapSides")
 
@@ -544,6 +545,9 @@ def optimized_run(
                     print(f"Screenshot saved: {screenshot_path}")
                 elif key == ord('x'):
                     sides_swapped = not sides_swapped
+                    rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
+                    rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
+                    score_freeze_until_frame = frame_idx + int(fps * 8)
                     print(f"Sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
                 continue
 
@@ -592,7 +596,7 @@ def optimized_run(
                             draw_pose_skeleton(frame, lm_px, color)
                 stats.record_phase('pose_infer', time.perf_counter() - t0)
 
-            if frame_idx % score_detect_interval == 0:
+            if frame_idx % score_detect_interval == 0 and frame_idx >= score_freeze_until_frame:
                 t0 = time.perf_counter()
                 scores, rounds = score_detector.update_scores_and_rounds(frame, rois, frame_idx)
                 stats.record_phase('score_infer', time.perf_counter() - t0)
@@ -606,8 +610,11 @@ def optimized_run(
                 prev_total_sets = total_sets
             elif total_sets > prev_total_sets and frame_idx - last_auto_swap_frame > fps * 10:
                 sides_swapped = not sides_swapped
+                rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
+                rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
                 last_auto_swap_frame = frame_idx
                 prev_total_sets = total_sets
+                score_freeze_until_frame = frame_idx + int(fps * 8)
                 print(f"[Auto] Set {total_sets} detected — sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
 
             rally_aggregator.add_frame(frame_idx, frame_idx / fps, tracks_with_meters, score_detector.stable_scores, rounds)
@@ -665,6 +672,9 @@ def optimized_run(
                 print(f"Screenshot saved: {screenshot_path}")
             elif key == ord('x'):
                 sides_swapped = not sides_swapped
+                rois['player1_score'], rois['player2_score'] = rois['player2_score'], rois['player1_score']
+                rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
+                score_freeze_until_frame = frame_idx + int(fps * 8)
                 print(f"Sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
 
     finally:
