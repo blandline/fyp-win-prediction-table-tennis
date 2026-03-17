@@ -108,7 +108,7 @@ RALLY_BALL_SEEN_FRAMES = 4    # Consecutive frames with ball to declare "rally s
 RALLY_BALL_MISSING_FRAMES = 30  # Consecutive frames without ball to declare "rally ended"
 
 # Trajectory visualization
-TRAJECTORY_LENGTH = 50  # Number of points to show in trajectory
+TRAJECTORY_LENGTH = 30  # Number of points to show in trajectory
 SPEED_SMOOTHING_WINDOW = 5  # Frames to average speed over
 
 # ITTF table dimensions (meters)
@@ -731,18 +731,12 @@ class BallTracker:
             # Draw bounding box
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
             
-            # Draw trajectory
+            # Draw trajectory — single polylines call instead of N individual cv2.line calls
             if track_id in self.trajectories:
                 points = list(self.trajectories[track_id])
-                for i in range(1, len(points)):
-                    # Color gradient from red (old) to green (new)
-                    alpha = i / len(points)
-                    color = (0, int(255 * alpha), int(255 * (1 - alpha)))
-                    thickness = max(1, int(3 * alpha))
-                    
-                    pt1 = (int(points[i-1][0]), int(points[i-1][1]))
-                    pt2 = (int(points[i][0]), int(points[i][1]))
-                    cv2.line(frame, pt1, pt2, color, thickness)
+                if len(points) >= 2:
+                    pts = np.array([[int(p[0]), int(p[1])] for p in points], dtype=np.int32)
+                    cv2.polylines(frame, [pts], isClosed=False, color=(0, 220, 255), thickness=2)
             
             # Draw speed (m/s when table calibration is valid, else px/s)
             speed_mps = self.get_smoothed_speed_mps(track_id)
@@ -765,7 +759,8 @@ class ScoreDetector:
     def __init__(self, model_path):
         """Initialize YOLO digit model with image preprocessing."""
         self.model = YOLO(model_path)
-        
+        self._clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+
         self.score_history = {
             'player1': deque(maxlen=5),
             'player2': deque(maxlen=5)
@@ -820,8 +815,7 @@ class ScoreDetector:
             gray = crop.copy()
         
         # Apply CLAHE for contrast enhancement
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
+        enhanced = self._clahe.apply(gray)
         
         # Slight Gaussian blur to reduce noise
         blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
@@ -975,11 +969,8 @@ class ScoreDetector:
         h, w = frame.shape[:2]
         
         # Draw score boxes at top of frame
-        overlay = frame.copy()
-        
         # Player 1 score box (left)
-        cv2.rectangle(overlay, (20, 20), (200, 100), (0, 100, 0), -1)
-        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        cv2.rectangle(frame, (20, 20), (200, 100), (0, 70, 0), -1)
         
         p1_score = self.current_scores['player1']
         p1_score_text = str(p1_score) if p1_score is not None else "--"
@@ -991,9 +982,7 @@ class ScoreDetector:
         cv2.putText(frame, f"Sets: {sets_p1}", (120, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
         
         # Player 2 score box (right)
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (w - 200, 20), (w - 20, 100), (100, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        cv2.rectangle(frame, (w - 200, 20), (w - 20, 100), (70, 0, 0), -1)
         
         p2_score = self.current_scores['player2']
         p2_score_text = str(p2_score) if p2_score is not None else "--"
@@ -1210,7 +1199,7 @@ class RallyAggregator:
 # =============================================================================
 # Target pose FPS (frames per second at which pose is computed).
 # At 60 FPS video this means pose runs every 6th frame (~10 Hz).
-POSE_TARGET_FPS = 10.0
+POSE_TARGET_FPS = 6.0
 
 # Minimum landmark visibility to trust a computed angle / position.
 POSE_MIN_VISIBILITY = 0.5
@@ -1754,10 +1743,8 @@ class RealtimeStats:
         h, w = frame.shape[:2]
 
         # Stats panel background (bottom-left) — extended for timing rows + rally status + pose
-        overlay = frame.copy()
         panel_h = 191
-        cv2.rectangle(overlay, (10, h - panel_h - 10), (340, h - 10), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+        cv2.rectangle(frame, (10, h - panel_h - 10), (340, h - 10), (15, 15, 15), -1)
 
         y = h - panel_h + 5
         line_height = 18
@@ -1798,10 +1785,7 @@ class RealtimeStats:
             y += line_height
             # Large banner near the top of the frame for easy visual check
             banner_y = 50
-            banner_h = 36
-            overlay2 = frame.copy()
-            cv2.rectangle(overlay2, (0, banner_y - 28), (w, banner_y + banner_h - 28), (0, 0, 0), -1)
-            cv2.addWeighted(overlay2, 0.55, frame, 0.45, 0, frame)
+            cv2.rectangle(frame, (0, banner_y - 28), (w, banner_y + 8), (10, 10, 10), -1)
             cv2.putText(frame, label, (w // 2 - 160, banner_y), cv2.FONT_HERSHEY_SIMPLEX,
                         0.9, color, 2)
 

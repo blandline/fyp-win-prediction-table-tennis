@@ -102,7 +102,7 @@ def video_writer_thread(write_queue, output_path, fourcc, fps, write_w, write_h,
 # =============================================================================
 # BATCHED SCORE DETECTOR (same API as ScoreDetector, batched inference)
 # =============================================================================
-def _preprocess_for_detection(crop):
+def _preprocess_for_detection(crop, clahe=None):
     """Same as ScoreDetector.preprocess_for_detection (copied to avoid modifying original)."""
     if crop is None or crop.size == 0:
         return None
@@ -115,7 +115,8 @@ def _preprocess_for_detection(crop):
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     else:
         gray = crop.copy()
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    if clahe is None:
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
     blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
     _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -170,6 +171,7 @@ class ScoreDetectorBatched:
         self.model = YOLO(model_path)
         # TensorRT engines are typically built with batch size 1; batch inference will fail
         self._is_tensorrt = str(model_path).endswith('.engine') or Path(model_path).suffix == '.engine'
+        self._clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         self.score_history = {'player1': deque(maxlen=5), 'player2': deque(maxlen=5)}
         self.current_scores = {'player1': None, 'player2': None}
         self.stable_scores = {'player1': None, 'player2': None}
@@ -181,7 +183,7 @@ class ScoreDetectorBatched:
         self.score_roi_obscured = {'player1': False, 'player2': False}
         self.rounds_roi_obscured = {'player1': False, 'player2': False}
         self.last_processed_frame = None
-        self._imgsz = 320
+        self._imgsz = 160
 
     def stop(self):
         pass
@@ -196,7 +198,7 @@ class ScoreDetectorBatched:
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
             return None
-        processed = _preprocess_for_detection(crop)
+        processed = _preprocess_for_detection(crop, clahe=self._clahe)
         return processed if processed is not None else crop
 
     def _build_batch(self, frame, rois):
@@ -310,9 +312,7 @@ class ScoreDetectorBatched:
     def draw_scores(self, frame, rois):
         """Same drawing as original ScoreDetector.draw_scores (copied)."""
         h, w = frame.shape[:2]
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (20, 20), (200, 100), (0, 100, 0), -1)
-        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        cv2.rectangle(frame, (20, 20), (200, 100), (0, 70, 0), -1)
         p1_score = self.current_scores['player1']
         p1_score_text = str(p1_score) if p1_score is not None else "--"
         if self.score_roi_obscured['player1']:
@@ -321,9 +321,7 @@ class ScoreDetectorBatched:
         cv2.putText(frame, p1_score_text, (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
         sets_p1 = str(self.rounds['player1']) + (" (obscured)" if self.rounds_roi_obscured['player1'] else "")
         cv2.putText(frame, f"Sets: {sets_p1}", (120, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (w - 200, 20), (w - 20, 100), (100, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        cv2.rectangle(frame, (w - 200, 20), (w - 20, 100), (70, 0, 0), -1)
         p2_score = self.current_scores['player2']
         p2_score_text = str(p2_score) if p2_score is not None else "--"
         if self.score_roi_obscured['player2']:
@@ -401,7 +399,7 @@ def optimized_run(
     output_size=None,
     use_tensorrt=False,
     config_path=None,
-    async_write=False,
+    async_write=True,
 ):
     """
     Run tracking with optimized pipeline: frame producer thread, batched digit inference,
@@ -719,11 +717,13 @@ if __name__ == "__main__":
                         help="Downscale saved video to WxH")
     parser.add_argument("--score-interval", metavar="SEC", type=float, default=2.0,
                         help="Seconds between score detector runs (default: 2.0)")
-    parser.add_argument("--async-write", action="store_true", help="Use background thread for video writing")
+    parser.add_argument("--no-async-write", dest="async_write", action="store_false",
+                        help="Disable background thread for video writing (async write is on by default)")
     parser.add_argument("--use-tensorrt", action="store_true", help="Require TensorRT .engine models")
     parser.add_argument("--benchmark", metavar="N", type=int, default=0,
                         help="Run headless ball-inference benchmark over N frames and exit")
 
+    parser.set_defaults(async_write=True)
     args = parser.parse_args()
     inf_size = args.ball_inference_size if args.ball_inference_size is not None else getattr(bta, 'BALL_INFERENCE_SIZE', None)
 
