@@ -309,15 +309,17 @@ class ScoreDetectorBatched:
         """API compatibility: must be called after update_scores in same cycle; rounds already updated."""
         return self.rounds
 
-    def draw_scores(self, frame, rois):
+    def draw_scores(self, frame, rois, player_names=None):
         """Same drawing as original ScoreDetector.draw_scores (copied)."""
         h, w = frame.shape[:2]
+        p1_name = (player_names[0] if player_names else None) or "Player 1"
+        p2_name = (player_names[1] if player_names else None) or "Player 2"
         cv2.rectangle(frame, (20, 20), (200, 100), (0, 70, 0), -1)
         p1_score = self.current_scores['player1']
         p1_score_text = str(p1_score) if p1_score is not None else "--"
         if self.score_roi_obscured['player1']:
             p1_score_text += " (obscured)"
-        cv2.putText(frame, "Player 1", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(frame, p1_name, (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         cv2.putText(frame, p1_score_text, (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
         sets_p1 = str(self.rounds['player1']) + (" (obscured)" if self.rounds_roi_obscured['player1'] else "")
         cv2.putText(frame, f"Sets: {sets_p1}", (120, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
@@ -326,7 +328,7 @@ class ScoreDetectorBatched:
         p2_score_text = str(p2_score) if p2_score is not None else "--"
         if self.score_roi_obscured['player2']:
             p2_score_text += " (obscured)"
-        cv2.putText(frame, "Player 2", (w - 190, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(frame, p2_name, (w - 190, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         cv2.putText(frame, p2_score_text, (w - 190, 85), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
         sets_p2 = str(self.rounds['player2']) + (" (obscured)" if self.rounds_roi_obscured['player2'] else "")
         cv2.putText(frame, f"Sets: {sets_p2}", (w - 90, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
@@ -335,6 +337,73 @@ class ScoreDetectorBatched:
                 x1, y1, x2, y2 = roi
                 color = (0, 255, 0) if 'player1' in roi_name else (255, 255, 0)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+
+# =============================================================================
+# MANUAL SCORE TRACKER  (replaces ScoreDetectorBatched when score_mode='manual')
+# =============================================================================
+class ManualScoreTracker:
+    """
+    Drop-in replacement for ScoreDetectorBatched when the user enters scores manually.
+    No OCR is run. Scores are adjusted via key presses (1/2 to increment, [/] to decrement).
+    Z key swaps score display without changing pose or ROIs.
+    """
+
+    def __init__(self, initial_scores=None, initial_rounds=None):
+        self.current_scores = {'player1': 0, 'player2': 0}
+        self.stable_scores  = {'player1': 0, 'player2': 0}
+        self.rounds         = {'player1': 0, 'player2': 0}
+        self.score_roi_obscured  = {'player1': False, 'player2': False}
+        self.rounds_roi_obscured = {'player1': False, 'player2': False}
+        if initial_scores:
+            self.current_scores.update(initial_scores)
+            self.stable_scores.update(initial_scores)
+        if initial_rounds:
+            self.rounds.update(initial_rounds)
+
+    def stop(self):
+        pass
+
+    def adjust(self, player, delta):
+        """Increment or decrement a player's score. player='player1' or 'player2', delta=+1|-1."""
+        v = max(0, self.current_scores[player] + delta)
+        self.current_scores[player] = v
+        self.stable_scores[player]  = v
+
+    def adjust_rounds(self, player, delta):
+        """Increment or decrement a player's set count."""
+        v = max(0, self.rounds[player] + delta)
+        self.rounds[player] = v
+
+    def swap_scores(self):
+        """Swap score+sets display between players (no ROI/pose change)."""
+        s = self.current_scores
+        r = self.rounds
+        s['player1'], s['player2'] = s['player2'], s['player1']
+        r['player1'], r['player2'] = r['player2'], r['player1']
+        self.stable_scores['player1'] = s['player1']
+        self.stable_scores['player2'] = s['player2']
+
+    def draw_scores(self, frame, rois, player_names=None):
+        """Draw score overlay without ROI rectangles (no OCR regions in manual mode)."""
+        h, w = frame.shape[:2]
+        p1_name = (player_names[0] if player_names else None) or "Player 1"
+        p2_name = (player_names[1] if player_names else None) or "Player 2"
+        cv2.rectangle(frame, (20, 20), (200, 100), (0, 70, 0), -1)
+        cv2.putText(frame, p1_name, (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(frame, str(self.current_scores['player1']), (30, 85),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
+        cv2.putText(frame, f"Sets: {self.rounds['player1']}", (120, 85),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.rectangle(frame, (w - 200, 20), (w - 20, 100), (70, 0, 0), -1)
+        cv2.putText(frame, p2_name, (w - 190, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(frame, str(self.current_scores['player2']), (w - 190, 85),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
+        cv2.putText(frame, f"Sets: {self.rounds['player2']}", (w - 90, 85),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        # Manual mode hint
+        cv2.putText(frame, "MANUAL SCORES  1/2:+  [/]:- Z:swap sets", (20, 115),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 60), 1)
 
 
 # =============================================================================
@@ -400,6 +469,10 @@ def optimized_run(
     use_tensorrt=False,
     config_path=None,
     async_write=True,
+    score_mode="auto",        # "auto" (OCR) | "manual" (key-driven)
+    initial_scores=None,      # {"player1": 0, "player2": 0}  — manual mode only
+    initial_rounds=None,      # {"player1": 0, "player2": 0}  — manual mode only
+    player_names=None,        # ["Player 1 name", "Player 2 name"]
 ):
     """
     Run tracking with optimized pipeline: frame producer thread, batched digit inference,
@@ -466,7 +539,12 @@ def optimized_run(
 
     print("\nLoading models...")
     ball_tracker = BallTracker(ball_model_path, fps, table_calibration=table_calibration, inference_size=inference_size)
-    score_detector = ScoreDetectorBatched(digit_model_path)
+    if score_mode == "manual":
+        score_detector = ManualScoreTracker(initial_scores=initial_scores, initial_rounds=initial_rounds)
+        print("Score mode:   MANUAL (use 1/2 to score, [/] to undo, Z to swap)")
+    else:
+        score_detector = ScoreDetectorBatched(digit_model_path)
+        print("Score mode:   AUTO (OCR)")
     logger = DataLogger(output_dir, with_meters=(table_calibration is not None and table_calibration.is_valid()))
     rally_aggregator = RallyAggregator(fps, logger, table_calibration)
     stats = RealtimeStats(fps)
@@ -517,7 +595,11 @@ def optimized_run(
     sides_swapped = False
     score_freeze_until_frame = 0
 
-    print("\nOptimized tracking started. Q=Quit P=Pause +/-=Speed S=Screenshot X=SwapSides")
+    if score_mode == "manual":
+        print("\nOptimized tracking started. Q=Quit P=Pause +/-=Speed S=Screenshot X=SwapSides")
+        print("Manual score keys: 1/2=+1 point  [/]=-1 point  3/4=+1 set  Z=swap scores")
+    else:
+        print("\nOptimized tracking started. Q=Quit P=Pause +/-=Speed S=Screenshot X=SwapSides")
 
     try:
         while True:
@@ -545,6 +627,27 @@ def optimized_run(
                     rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
                     score_freeze_until_frame = frame_idx + int(fps * 8)
                     print(f"Sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
+                elif key == ord('1') and score_mode == "manual":
+                    score_detector.adjust('player1', +1)
+                    print(f"P1 score: {score_detector.current_scores['player1']}")
+                elif key == ord('2') and score_mode == "manual":
+                    score_detector.adjust('player2', +1)
+                    print(f"P2 score: {score_detector.current_scores['player2']}")
+                elif key == ord('[') and score_mode == "manual":
+                    score_detector.adjust('player1', -1)
+                    print(f"P1 score: {score_detector.current_scores['player1']}")
+                elif key == ord(']') and score_mode == "manual":
+                    score_detector.adjust('player2', -1)
+                    print(f"P2 score: {score_detector.current_scores['player2']}")
+                elif key == ord('z') and score_mode == "manual":
+                    score_detector.swap_scores()
+                    print(f"Scores swapped — P1:{score_detector.current_scores['player1']} P2:{score_detector.current_scores['player2']}")
+                elif key == ord('3') and score_mode == "manual":
+                    score_detector.adjust_rounds('player1', +1)
+                    print(f"P1 sets: {score_detector.rounds['player1']}")
+                elif key == ord('4') and score_mode == "manual":
+                    score_detector.adjust_rounds('player2', +1)
+                    print(f"P2 sets: {score_detector.rounds['player2']}")
                 continue
 
             # Get next frame from producer (blocking)
@@ -592,7 +695,7 @@ def optimized_run(
                             draw_pose_skeleton(frame, lm_px, color)
                 stats.record_phase('pose_infer', time.perf_counter() - t0)
 
-            if frame_idx % score_detect_interval == 0 and frame_idx >= score_freeze_until_frame:
+            if score_mode == "auto" and frame_idx % score_detect_interval == 0 and frame_idx >= score_freeze_until_frame:
                 t0 = time.perf_counter()
                 scores, rounds = score_detector.update_scores_and_rounds(frame, rois, frame_idx)
                 stats.record_phase('score_infer', time.perf_counter() - t0)
@@ -609,7 +712,7 @@ def optimized_run(
             if current_score_log != last_score_log:
                 logger.log_score(frame_idx, frame_idx / fps, scores, rounds, score_detector.score_roi_obscured, score_detector.rounds_roi_obscured)
                 last_score_log = current_score_log
-            score_detector.draw_scores(frame, rois)
+            score_detector.draw_scores(frame, rois, player_names=player_names)
             stats.record_phase('draw', time.perf_counter() - t0)
 
             stats.update()
@@ -659,6 +762,27 @@ def optimized_run(
                 rois['player1_rounds'], rois['player2_rounds'] = rois['player2_rounds'], rois['player1_rounds']
                 score_freeze_until_frame = frame_idx + int(fps * 8)
                 print(f"Sides swapped: Player 1 now on {'right' if sides_swapped else 'left'}")
+            elif key == ord('1') and score_mode == "manual":
+                score_detector.adjust('player1', +1)
+                print(f"P1 score: {score_detector.current_scores['player1']}")
+            elif key == ord('2') and score_mode == "manual":
+                score_detector.adjust('player2', +1)
+                print(f"P2 score: {score_detector.current_scores['player2']}")
+            elif key == ord('[') and score_mode == "manual":
+                score_detector.adjust('player1', -1)
+                print(f"P1 score: {score_detector.current_scores['player1']}")
+            elif key == ord(']') and score_mode == "manual":
+                score_detector.adjust('player2', -1)
+                print(f"P2 score: {score_detector.current_scores['player2']}")
+            elif key == ord('z') and score_mode == "manual":
+                score_detector.swap_scores()
+                print(f"Scores swapped — P1:{score_detector.current_scores['player1']} P2:{score_detector.current_scores['player2']}")
+            elif key == ord('3') and score_mode == "manual":
+                score_detector.adjust_rounds('player1', +1)
+                print(f"P1 sets: {score_detector.rounds['player1']}")
+            elif key == ord('4') and score_mode == "manual":
+                score_detector.adjust_rounds('player2', +1)
+                print(f"P2 sets: {score_detector.rounds['player2']}")
 
     finally:
         score_detector.stop()
@@ -720,6 +844,14 @@ if __name__ == "__main__":
     parser.add_argument("--no-async-write", dest="async_write", action="store_false",
                         help="Disable background thread for video writing (async write is on by default)")
     parser.add_argument("--use-tensorrt", action="store_true", help="Require TensorRT .engine models")
+    parser.add_argument("--manual-scores", action="store_true",
+                        help="Disable OCR; enter scores manually with keyboard (1/2/[/]/3/4/Z keys)")
+    parser.add_argument("--initial-scores", metavar="P1,P2", default="0,0",
+                        help="Starting scores for manual mode, e.g. '3,5' (default: 0,0)")
+    parser.add_argument("--initial-rounds", metavar="P1,P2", default="0,0",
+                        help="Starting set counts for manual mode, e.g. '1,2' (default: 0,0)")
+    parser.add_argument("--player-names", metavar="NAME1,NAME2", default=None,
+                        help="Player display names, e.g. 'Alice,Bob'")
     parser.add_argument("--benchmark", metavar="N", type=int, default=0,
                         help="Run headless ball-inference benchmark over N frames and exit")
 
@@ -739,6 +871,21 @@ if __name__ == "__main__":
         cap.release()
         sys.exit(0)
 
+    # Parse manual score/rounds initial values
+    def _parse_two_ints(s, default=(0, 0)):
+        try:
+            a, b = s.split(',')
+            return int(a.strip()), int(b.strip())
+        except Exception:
+            return default
+
+    p1s, p2s = _parse_two_ints(args.initial_scores)
+    p1r, p2r = _parse_two_ints(args.initial_rounds)
+    player_names = None
+    if args.player_names:
+        parts = args.player_names.split(',', 1)
+        player_names = [p.strip() for p in parts] if len(parts) == 2 else None
+
     optimized_run(
         args.video,
         output_dir=args.output,
@@ -749,4 +896,8 @@ if __name__ == "__main__":
         use_tensorrt=args.use_tensorrt,
         config_path=args.config,
         async_write=args.async_write,
+        score_mode="manual" if args.manual_scores else "auto",
+        initial_scores={'player1': p1s, 'player2': p2s},
+        initial_rounds={'player1': p1r, 'player2': p2r},
+        player_names=player_names,
     )
