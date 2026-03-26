@@ -51,6 +51,7 @@ from ultralytics import YOLO
 # CONFIGURATION
 # =============================================================================
 BALL_MODEL_PATH = "runs/detect/runs/ball_detector/weights/best.pt"
+# BALL_MODEL_PATH = "runs/detect/runs/ball_detector_broadcast/weights/best.pt"
 DIGIT_MODEL_PATH = "runs/detect/runs/detect/digits_v2/weights/best.pt"
 
 
