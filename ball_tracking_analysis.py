@@ -751,6 +751,10 @@ class BallTracker:
             # Draw ball center
             cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1)
 
+    def set_table_calibration(self, table_calibration):
+        """Update table calibration (e.g. when corners are re-detected in broadcast mode)."""
+        self.table_calibration = table_calibration
+
 
 # =============================================================================
 # SCORE DETECTION WITH YOLO + PREPROCESSING
@@ -1038,6 +1042,10 @@ class RallyAggregator:
         self.state = self.STATE_BETWEEN_POINTS
         self.ball_seen_consecutive = 0
         self.ball_missing_consecutive = 0
+
+    def set_table_calibration(self, table_calibration):
+        """Update table calibration (e.g. when corners are re-detected in broadcast mode)."""
+        self.table_calibration = table_calibration
 
     def _ball_in_play(self, tracks_with_meters):
         """True if ball is detected. With calibration, must be on/near table."""
