@@ -20,7 +20,7 @@ def main():
     model = YOLO(CHECKPOINT)
 
     model.train(
-        data="ball_broadcast.yaml",
+        data="ball_roboflow.yaml",
         epochs=60,
         imgsz=960,
         batch=24,
