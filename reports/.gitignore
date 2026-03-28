@@ -1,0 +1,4 @@
+# Ignore generated report files; keep this folder tracked via .gitkeep
+*
+!.gitkeep
+!.gitignore
