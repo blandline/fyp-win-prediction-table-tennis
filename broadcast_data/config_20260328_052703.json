@@ -1,0 +1,30 @@
+{
+  "video_path": "C:\\Users\\msarbulan2\\Downloads\\sniped\\sniped\\FULL MATCH  Felix Lebrun vs Truls Moregard  MS QF  WTTFrankfurt 2024 (snipped).mp4",
+  "fps": 50.0,
+  "rois": {
+    "player1_score": null,
+    "player2_score": null,
+    "player1_rounds": null,
+    "player2_rounds": null
+  },
+  "ball_model": "runs/detect/runs/ball_detector/weights/best.pt",
+  "digit_model": "runs/detect/runs/detect/digits_v2/weights/best.pt",
+  "table_corners": [
+    [
+      454.0,
+      349.0
+    ],
+    [
+      818.0,
+      352.0
+    ],
+    [
+      852.0,
+      448.0
+    ],
+    [
+      429.0,
+      451.0
+    ]
+  ]
+}
