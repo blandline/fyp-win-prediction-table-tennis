@@ -101,6 +101,13 @@ def _build_args(cfg):
     if cfg.get("sets_to_win"):
         args += ["--sets-to-win", str(cfg["sets_to_win"])]
 
+    if cfg.get("auto_scene"):
+        args.append("--auto-scene")
+        args += ["--table-color", cfg.get("table_color", "blue")]
+
+    if cfg.get("auto_table_track"):
+        args.append("--auto-table-track")
+
     return args
 
 
@@ -138,11 +145,12 @@ with st.sidebar:
 | **Z** | Swap score display |
 """)
     st.markdown("---")
-    st.markdown("**F — Scene skip toggle**")
+    st.markdown("**F — Scene skip toggle** *(manual mode only)*")
     st.caption(
         "Press **F** when a cutscene or replay starts to pause inference. "
         "Press **F** again when gameplay resumes — this also resets the ball "
-        "tracker so stale tracks from the cutscene don't bleed into the next rally."
+        "tracker so stale tracks from the cutscene don't bleed into the next rally. "
+        "**Disabled when Auto scene classifier is enabled.**"
     )
     st.markdown("**D — Rally discard**")
     st.caption(
@@ -324,6 +332,39 @@ with st.expander("Advanced settings"):
         )
 
 # ---------------------------------------------------------------------------
+# Auto-detection features (experimental)
+# ---------------------------------------------------------------------------
+with st.expander("Auto-detection features (experimental)", expanded=False):
+    st.caption(
+        "These features were removed from the default pipeline due to reliability issues. "
+        "Enable at your own risk — manual controls (F key, fixed corners) remain the default."
+    )
+    auto_scene = st.checkbox(
+        "Auto scene classifier",
+        value=False,
+        help=(
+            "Use frame-differencing + table-color heuristics to automatically detect "
+            "cutscenes and replays. When enabled, the F key is ignored. "
+            "Default: manual F key toggle."
+        ),
+    )
+    table_color = st.selectbox(
+        "Table color (for scene classifier)",
+        ["blue", "green"],
+        disabled=not auto_scene,
+        help="Dominant table surface color used by the scene classifier to detect gameplay.",
+    )
+    auto_table_track = st.checkbox(
+        "Auto table corner tracking (optical flow)",
+        value=False,
+        help=(
+            "Track the 4 table corners frame-to-frame using Lucas-Kanade optical flow "
+            "so the calibration adapts to slow camera pans. "
+            "Default: fixed corners from the setup step."
+        ),
+    )
+
+# ---------------------------------------------------------------------------
 # Start button
 # ---------------------------------------------------------------------------
 st.markdown("---")
@@ -371,6 +412,9 @@ if start:
             "ittf_name2": ittf_name2.strip() if ittf_name2 else None,
             "sets_to_win": int(sets_to_win),
             "best_of": int(_best_of),
+            "auto_scene": bool(auto_scene),
+            "table_color": str(table_color),
+            "auto_table_track": bool(auto_table_track),
         }
         if score_mode == "manual":
             cfg["initial_scores"] = {"player1": int(init_score_p1), "player2": int(init_score_p2)}

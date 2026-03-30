@@ -70,6 +70,8 @@ from ball_tracking_fast import (
 )
 from prediction_model_base import PredictionResult
 from prediction_pipeline import load_prediction_model, build_packet, draw_prediction_overlay
+from broadcast_utils import SceneClassifier, TableTracker
+from broadcast_utils.scene_classifier import GAMEPLAY, CUT_DETECTED, NON_GAMEPLAY
 
 
 # =============================================================================
@@ -188,12 +190,24 @@ class SkippableRallyAggregator(RallyAggregator):
 def _draw_scene_overlay(frame, gate, skipped_frames):
     """Draw the inference state indicator in the bottom-right corner."""
     h, w = frame.shape[:2]
-    if gate.skipping:
-        color = (0, 200, 200)
-        text = f"SCENE SKIP — F to resume  (skipped: {skipped_frames})"
+    if isinstance(gate, SceneClassifier):
+        state = gate.state
+        if state == GAMEPLAY:
+            color = (0, 200, 0)
+            text = f"AUTO: GAMEPLAY  (skipped: {skipped_frames})"
+        elif state == CUT_DETECTED:
+            color = (0, 200, 200)
+            text = f"AUTO: CUT DETECTED  (skipped: {skipped_frames})"
+        else:
+            color = (0, 100, 200)
+            text = f"AUTO: NON-GAMEPLAY  (skipped: {skipped_frames})"
     else:
-        color = (0, 200, 0)
-        text = "COLLECTING — F to skip scene"
+        if gate.skipping:
+            color = (0, 200, 200)
+            text = f"SCENE SKIP — F to resume  (skipped: {skipped_frames})"
+        else:
+            color = (0, 200, 0)
+            text = "COLLECTING — F to skip scene"
     cv2.putText(frame, text, (w - 500, h - 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
@@ -241,6 +255,9 @@ def collect(
     broadcast_model=None,
     score_interval_sec=2.0,
     prediction_model=None,
+    auto_scene=False,
+    table_color="blue",
+    auto_table_track=False,
 ):
     """Main data collection loop."""
     # ------------------------------------------------------------------
@@ -295,9 +312,19 @@ def collect(
             table_calibration = None
 
     # ------------------------------------------------------------------
-    # Scene gate (always on — purely manual)
+    # Scene gate — manual (default) or automatic SceneClassifier
     # ------------------------------------------------------------------
-    scene_gate = ManualSceneGate()
+    if auto_scene:
+        scene_gate = SceneClassifier(table_color=table_color)
+    else:
+        scene_gate = ManualSceneGate()
+
+    # ------------------------------------------------------------------
+    # Table tracker — optical flow (optional, experimental)
+    # ------------------------------------------------------------------
+    table_tracker = None
+    if auto_table_track and table_calibration is not None:
+        table_tracker = TableTracker(table_corners)
 
     # ------------------------------------------------------------------
     # Print summary
@@ -310,6 +337,8 @@ def collect(
     if inference_size:
         print(f"Ball inference size : {inference_size[0]}x{inference_size[1]}")
     print(f"Table calibration : {'ON' if table_calibration else 'OFF (no corners marked)'}")
+    print(f"Table tracking    : {'AUTO (optical flow)' if table_tracker else 'FIXED'}")
+    print(f"Scene gate        : {'AUTO (SceneClassifier, table=' + table_color + ')' if auto_scene else 'MANUAL (F key)'}")
     print(f"Score mode : {score_mode.upper()}")
 
     # ------------------------------------------------------------------
@@ -418,11 +447,21 @@ def collect(
         elif key == ord('p'):
             return 'pause_toggle'
         elif key == ord('f'):
-            now_skipping = scene_gate.toggle()
-            if not now_skipping:
-                # Resuming — reset tracker so stale tracks are cleared
-                _reset_ball_tracker(ball_tracker, last_displayed_frame)
-            print(f"Scene skip: {'ON — inference paused' if now_skipping else 'OFF — collecting'}")
+            if auto_scene:
+                print("Scene skip: F key ignored — auto scene classifier is active")
+            else:
+                now_skipping = scene_gate.toggle()
+                if not now_skipping:
+                    # Resuming — reset tracker so stale tracks are cleared
+                    _reset_ball_tracker(ball_tracker, last_displayed_frame)
+                    if table_tracker is not None:
+                        reinit_corners = (
+                            table_calibration.pixel_corners
+                            if table_calibration is not None
+                            else table_corners
+                        )
+                        table_tracker.reinitialize(reinit_corners, last_displayed_frame)
+                print(f"Scene skip: {'ON — inference paused' if now_skipping else 'OFF — collecting'}")
         elif key == ord('d'):
             rally_aggregator.mark_skipped()
             print(f"Rally #{rally_aggregator.rally_id} marked as SKIPPED")
@@ -463,6 +502,8 @@ def collect(
                         table_calibration = tc
                         ball_tracker.set_table_calibration(tc)
                         rally_aggregator.set_table_calibration(tc)
+                        if table_tracker is not None:
+                            table_tracker.reinitialize(new_corners, last_displayed_frame)
                         print("Table corners updated!")
                     else:
                         print("Invalid corners, keeping previous.")
@@ -523,6 +564,20 @@ def collect(
                 break
             frame_idx, frame = item
 
+            # ---- Auto scene classifier update (runs every frame when enabled) ----
+            if auto_scene:
+                scene_gate.update(frame)
+                if scene_gate.is_cut:
+                    _reset_ball_tracker(ball_tracker, frame)
+                    if table_tracker is not None:
+                        reinit_corners = (
+                            table_calibration.pixel_corners
+                            if table_calibration is not None
+                            else table_corners
+                        )
+                        table_tracker.reinitialize(reinit_corners, frame)
+                    scene_gate.is_cut = False
+
             # ---- Scene gate: skip inference if active ----
             if not scene_gate.should_process:
                 skipped_frames += 1
@@ -539,6 +594,16 @@ def collect(
                 elif action == 'pause_toggle':
                     paused = True
                 continue
+
+            # ---- Table corner tracking (optical flow, when enabled) ----
+            if table_tracker is not None:
+                new_corners = table_tracker.update(frame)
+                if table_tracker.is_valid:
+                    tc = TableCalibration(new_corners.tolist())
+                    if tc.is_valid():
+                        table_calibration = tc
+                        ball_tracker.set_table_calibration(tc)
+                        rally_aggregator.set_table_calibration(tc)
 
             # ---- Ball detection & tracking ----
             t0 = time.perf_counter()
@@ -774,6 +839,15 @@ Keyboard controls (OpenCV window):
                         help="ITTF-format name of Player 2 for late fusion profile lookup.")
     parser.add_argument("--sets-to-win", metavar="N", type=int, default=3,
                         help="Number of sets needed to win the match (default: 3, i.e. Best of 5).")
+    parser.add_argument("--auto-scene", action="store_true",
+                        help="Enable automatic scene classifier (experimental). "
+                             "Uses frame-differencing + table-color heuristics to detect "
+                             "cutscenes. When active, the F key is ignored.")
+    parser.add_argument("--table-color", default="blue", choices=["blue", "green"],
+                        help="Table color preset for the auto scene classifier (default: blue).")
+    parser.add_argument("--auto-table-track", action="store_true",
+                        help="Enable optical-flow table corner tracking (experimental). "
+                             "Tracks corners frame-to-frame with Lucas-Kanade flow.")
 
     parser.set_defaults(async_write=True)
     args = parser.parse_args()
@@ -824,4 +898,7 @@ Keyboard controls (OpenCV window):
         broadcast_model=args.broadcast_model,
         score_interval_sec=args.score_interval,
         prediction_model=pred_model,
+        auto_scene=args.auto_scene,
+        table_color=args.table_color,
+        auto_table_track=args.auto_table_track,
     )
