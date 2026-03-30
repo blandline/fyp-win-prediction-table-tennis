@@ -41,8 +41,9 @@ digits-detect.v1i.yolov8/
 tracking_output/
 yolo_dataset/
 runs/
-CV Pipeline/
-Player_Profile/
+CV Pipeline/Data
+Player_Profile/h2h_pages
+Player_Profile/player_profiles
 system_design_diagrams/
 roboflow_combined_dataset/
 # Python junk
