@@ -1827,17 +1827,23 @@ class RealtimeStats:
         y += line_height
 
         # Progress
-        progress = frame_idx / total_frames if total_frames > 0 else 0
         time_sec = frame_idx / self.video_fps
-        total_time = total_frames / self.video_fps
-        cv2.putText(frame, f"Time: {time_sec:.1f}s / {total_time:.1f}s ({progress*100:.1f}%)",
-                    (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        if total_frames > 0:
+            progress = frame_idx / total_frames
+            total_time = total_frames / self.video_fps
+            cv2.putText(frame, f"Time: {time_sec:.1f}s / {total_time:.1f}s ({progress*100:.1f}%)",
+                        (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        else:
+            progress = 0
+            cv2.putText(frame, f"Elapsed: {time_sec:.1f}s  (LIVE)",
+                        (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-        # Progress bar (top)
+        # Progress bar (top) — only shown for file-based input
         bar_y = 5
         bar_h = 8
         cv2.rectangle(frame, (10, bar_y), (w - 10, bar_y + bar_h), (50, 50, 50), -1)
-        cv2.rectangle(frame, (10, bar_y), (10 + int((w - 20) * progress), bar_y + bar_h), (0, 200, 0), -1)
+        if total_frames > 0:
+            cv2.rectangle(frame, (10, bar_y), (10 + int((w - 20) * progress), bar_y + bar_h), (0, 200, 0), -1)
 
         # Pause indicator
         if paused:

@@ -53,7 +53,10 @@ def _size_to_str(size):
 
 def _build_args(cfg):
     """Convert config dict to CLI argument list for broadcast_data_collector.py."""
-    args = [sys.executable, str(COLLECTOR_SCRIPT), cfg["video_path"]]
+    if cfg.get("camera_index") is not None:
+        args = [sys.executable, str(COLLECTOR_SCRIPT), "--camera", str(cfg["camera_index"])]
+    else:
+        args = [sys.executable, str(COLLECTOR_SCRIPT), cfg["video_path"]]
     args += ["--output", cfg["output_dir"]]
 
     if cfg.get("roi_config_path"):
@@ -172,12 +175,31 @@ st.markdown("Configure the settings below, then click **▶ Start Collection**."
 col1, col2 = st.columns(2)
 
 with col1:
-    st.subheader("1. Video File")
-    video_path = st.text_input(
-        "Path to broadcast video file",
-        placeholder="C:/Videos/match.mp4",
-        help="Full path to the MP4, AVI, or MOV broadcast recording.",
+    st.subheader("1. Input Source")
+    input_source = st.radio(
+        "Input type",
+        ["Video file", "Camera (live feed)"],
+        horizontal=True,
+        help="Choose between a recorded video file or a live camera feed.",
     )
+
+    if input_source == "Video file":
+        video_path = st.text_input(
+            "Path to broadcast video file",
+            placeholder="C:/Videos/match.mp4",
+            help="Full path to the MP4, AVI, or MOV broadcast recording.",
+        )
+        camera_index = None
+    else:
+        camera_index = st.number_input(
+            "Camera index",
+            min_value=0,
+            max_value=10,
+            value=0,
+            step=1,
+            help="Index of the camera to use (0 = default webcam, 1 = second camera, etc.).",
+        )
+        video_path = None
 
     st.subheader("2. Output")
     output_dir = st.text_input(
@@ -374,10 +396,11 @@ with start_col:
 
 if start:
     errors = []
-    if not video_path:
-        errors.append("Video file path is required.")
-    elif not Path(video_path).exists():
-        errors.append(f"Video file not found: `{video_path}`")
+    if input_source == "Video file":
+        if not video_path:
+            errors.append("Video file path is required.")
+        elif not Path(video_path).exists():
+            errors.append(f"Video file not found: `{video_path}`")
     if not output_dir:
         errors.append("Output directory is required.")
     if roi_mode == "Load saved layout" and roi_config_path and not Path(roi_config_path).exists():
@@ -397,7 +420,8 @@ if start:
             st.error(e)
     else:
         cfg = {
-            "video_path": str(video_path),
+            "video_path": str(video_path) if video_path else None,
+            "camera_index": int(camera_index) if camera_index is not None else None,
             "output_dir": str(output_dir),
             "player_names": [p1_name.strip() or "Player 1", p2_name.strip() or "Player 2"],
             "score_mode": score_mode,
@@ -427,13 +451,20 @@ if start:
 
         cli_args = _build_args(cfg)
 
+        _setup_note = (
+            "An OpenCV setup window will open — use the mouse to mark score regions "
+            "and table corners, then press **Enter** to start.\n\n"
+            if not roi_config_path else ""
+        )
+        _source_note = (
+            f"Using **camera index {cfg['camera_index']}** as the live input source.\n\n"
+            if cfg.get("camera_index") is not None
+            else ""
+        )
         st.info(
             "**Collection pipeline launched!**\n\n"
-            + (
-                "An OpenCV setup window will open — use the mouse to mark score regions "
-                "and table corners, then press **Enter** to start.\n\n"
-                if not roi_config_path else ""
-            )
+            + _source_note
+            + _setup_note
             + "The tracking window will open on your desktop. "
             "Press **Q** to quit when done."
         )

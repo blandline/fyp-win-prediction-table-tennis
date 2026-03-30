@@ -258,6 +258,7 @@ def collect(
     auto_scene=False,
     table_color="blue",
     auto_table_track=False,
+    camera_index=None,
 ):
     """Main data collection loop."""
     # ------------------------------------------------------------------
@@ -273,13 +274,20 @@ def collect(
     # ------------------------------------------------------------------
     # Video capture
     # ------------------------------------------------------------------
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"Error: Could not open video: {video_path}")
-        return
+    is_live = camera_index is not None
+    if is_live:
+        cap = cv2.VideoCapture(camera_index)
+        if not cap.isOpened():
+            print(f"Error: Could not open camera index {camera_index}")
+            return
+    else:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"Error: Could not open video: {video_path}")
+            return
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = -1 if is_live else int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -300,7 +308,8 @@ def collect(
             cap.release()
             return
         rois, table_corners = result
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        if not is_live:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     # ------------------------------------------------------------------
     # Table calibration (fixed — no optical-flow tracking)
@@ -802,7 +811,11 @@ Keyboard controls (OpenCV window):
   Z          Swap score display (manual score mode)
 """,
     )
-    parser.add_argument("video", help="Path to broadcast video file")
+    parser.add_argument("video", nargs="?", default=None,
+                        help="Path to broadcast video file (omit when using --camera)")
+    parser.add_argument("--camera", "-cam", type=int, default=None, metavar="INDEX",
+                        help="Camera index for live feed (e.g. 0 for default webcam). "
+                             "Mutually exclusive with the video path argument.")
     parser.add_argument("--output", "-o", default="broadcast_data",
                         help="Output directory (default: broadcast_data)")
     parser.add_argument("--config", "-c", default=None,
@@ -852,6 +865,12 @@ Keyboard controls (OpenCV window):
     parser.set_defaults(async_write=True)
     args = parser.parse_args()
 
+    # Mutual exclusion: exactly one of video path or --camera must be provided
+    if args.camera is not None and args.video is not None:
+        parser.error("Provide either a video path or --camera, not both.")
+    if args.camera is None and args.video is None:
+        parser.error("Either a video path or --camera INDEX is required.")
+
     p1s, p2s = args.initial_scores.split(",")
     init_scores = {"player1": int(p1s), "player2": int(p2s)}
     p1r, p2r = args.initial_rounds.split(",")
@@ -899,6 +918,7 @@ Keyboard controls (OpenCV window):
         score_interval_sec=args.score_interval,
         prediction_model=pred_model,
         auto_scene=args.auto_scene,
+        camera_index=args.camera,
         table_color=args.table_color,
         auto_table_track=args.auto_table_track,
     )
