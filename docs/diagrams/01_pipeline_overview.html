@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Broadcast Pipeline — Overview</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #ffffff;
+      color: #000000;
+      font-family: "Segoe UI", Arial, sans-serif;
+      font-size: 13px;
+      padding: 40px;
+    }
+
+    h1 {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      border-bottom: 2px solid #000;
+      padding-bottom: 10px;
+      margin-bottom: 8px;
+    }
+
+    .subtitle {
+      font-size: 12px;
+      color: #444;
+      margin-bottom: 40px;
+    }
+
+    svg {
+      display: block;
+      margin: 0 auto;
+      overflow: visible;
+    }
+
+    /* nodes */
+    .node rect {
+      fill: #ffffff;
+      stroke: #000000;
+      stroke-width: 1.5px;
+    }
+    .node.dark rect {
+      fill: #000000;
+    }
+    .node.dark text {
+      fill: #ffffff;
+    }
+    .node text {
+      fill: #000000;
+      font-family: "Segoe UI", Arial, sans-serif;
+      font-size: 11px;
+      dominant-baseline: middle;
+      text-anchor: middle;
+    }
+
+    /* diamond decision */
+    .diamond polygon {
+      fill: #ffffff;
+      stroke: #000000;
+      stroke-width: 1.5px;
+    }
+    .diamond text {
+      fill: #000000;
+      font-family: "Segoe UI", Arial, sans-serif;
+      font-size: 11px;
+      dominant-baseline: middle;
+      text-anchor: middle;
+    }
+
+    /* edges */
+    .edge line, .edge path {
+      stroke: #000000;
+      stroke-width: 1.5px;
+      fill: none;
+    }
+    .edge-label {
+      font-family: "Segoe UI", Arial, sans-serif;
+      font-size: 10px;
+      fill: #333333;
+    }
+
+    /* group boxes */
+    .group rect {
+      fill: none;
+      stroke: #888888;
+      stroke-width: 1px;
+      stroke-dasharray: 5 3;
+    }
+    .group text {
+      font-family: "Segoe UI", Arial, sans-serif;
+      font-size: 10px;
+      fill: #555555;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .legend {
+      margin-top: 40px;
+      border-top: 1px solid #ccc;
+      padding-top: 16px;
+      display: flex;
+      gap: 32px;
+      flex-wrap: wrap;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: #333;
+    }
+    .legend-box {
+      width: 28px;
+      height: 16px;
+      border: 1.5px solid #000;
+      background: #fff;
+    }
+    .legend-box.dark {
+      background: #000;
+    }
+    .legend-box.dashed {
+      border: 1px dashed #888;
+      background: none;
+    }
+  </style>
+</head>
+<body>
+
+<h1>Broadcast Pipeline — Data Flow Overview</h1>
+<p class="subtitle">broadcast_data_collector.py &nbsp;|&nbsp; prediction_pipeline.py &nbsp;|&nbsp; ball_tracking_analysis.py</p>
+
+<svg width="1060" height="720" viewBox="0 0 1060 720">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#000" />
+    </marker>
+    <marker id="arrow-gray" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#888" />
+    </marker>
+  </defs>
+
+  <!-- ── GROUP: Input ── -->
+  <g class="group">
+    <rect x="20" y="20" width="200" height="80" rx="3" />
+    <text x="30" y="36">Input</text>
+  </g>
+
+  <!-- ── GROUP: CV Inference ── -->
+  <g class="group">
+    <rect x="20" y="140" width="620" height="400" rx="3" />
+    <text x="30" y="156">CV Inference (per frame)</text>
+  </g>
+
+  <!-- ── GROUP: Prediction ── -->
+  <g class="group">
+    <rect x="700" y="140" width="340" height="400" rx="3" />
+    <text x="710" y="156">Win Prediction</text>
+  </g>
+
+  <!-- ── GROUP: Output ── -->
+  <g class="group">
+    <rect x="700" y="590" width="340" height="110" rx="3" />
+    <text x="710" y="606">Output</text>
+  </g>
+
+  <!-- ===== NODES ===== -->
+
+  <!-- Input source -->
+  <g class="node dark" transform="translate(30,40)">
+    <rect x="0" y="0" width="180" height="44" rx="3" />
+    <text x="90" y="22">Input Source</text>
+  </g>
+
+  <!-- frame_producer_thread -->
+  <g class="node" transform="translate(30,160)">
+    <rect x="0" y="0" width="180" height="44" rx="3" />
+    <text x="90" y="16">frame_producer_thread</text>
+    <text x="90" y="30" style="font-size:10px;fill:#555">(background thread)</text>
+  </g>
+
+  <!-- Scene gate -->
+  <g class="node" transform="translate(240,160)">
+    <rect x="0" y="0" width="160" height="44" rx="3" />
+    <text x="80" y="16">Scene Gate</text>
+    <text x="80" y="30" style="font-size:10px;fill:#555">ManualSceneGate / SceneClassifier</text>
+  </g>
+
+  <!-- Table tracker -->
+  <g class="node" transform="translate(240,240)">
+    <rect x="0" y="0" width="160" height="44" rx="3" />
+    <text x="80" y="16">Table Tracker</text>
+    <text x="80" y="30" style="font-size:10px;fill:#555">optical flow (optional)</text>
+  </g>
+
+  <!-- BallTracker -->
+  <g class="node dark" transform="translate(240,320)">
+    <rect x="0" y="0" width="160" height="44" rx="3" />
+    <text x="80" y="16">BallTracker</text>
+    <text x="80" y="30" style="font-size:10px;fill:#aaa">YOLO + SORT</text>
+  </g>
+
+  <!-- PoseFeatureExtractor -->
+  <g class="node" transform="translate(30,400)">
+    <rect x="0" y="0" width="180" height="44" rx="3" />
+    <text x="90" y="16">PoseFeatureExtractor</text>
+    <text x="90" y="30" style="font-size:10px;fill:#555">MediaPipe (throttled ~6 Hz)</text>
+  </g>
+
+  <!-- ScoreDetector -->
+  <g class="node" transform="translate(240,400)">
+    <rect x="0" y="0" width="160" height="44" rx="3" />
+    <text x="80" y="16">ScoreDetector</text>
+    <text x="80" y="30" style="font-size:10px;fill:#555">YOLO OCR / Manual</text>
+  </g>
+
+  <!-- RallyAggregator -->
+  <g class="node" transform="translate(440,400)">
+    <rect x="0" y="0" width="180" height="44" rx="3" />
+    <text x="90" y="16">RallyAggregator</text>
+    <text x="90" y="30" style="font-size:10px;fill:#555">add_frame() per frame</text>
+  </g>
+
+  <!-- build_packet -->
+  <g class="node dark" transform="translate(240,490)">
+    <rect x="0" y="0" width="180" height="44" rx="3" />
+    <text x="90" y="16">build_packet()</text>
+    <text x="90" y="30" style="font-size:10px;fill:#aaa">prediction_pipeline.py</text>
+  </g>
+
+  <!-- PredictionDataPacket -->
+  <g class="node" transform="translate(710,200)">
+    <rect x="0" y="0" width="300" height="44" rx="3" />
+    <text x="150" y="16">PredictionDataPacket</text>
+    <text x="150" y="30" style="font-size:10px;fill:#555">ball · score · rally · pose · timestamps</text>
+  </g>
+
+  <!-- on_point_scored -->
+  <g class="node" transform="translate(710,290)">
+    <rect x="0" y="0" width="300" height="44" rx="3" />
+    <text x="150" y="16">on_point_scored(packet)</text>
+    <text x="150" y="30" style="font-size:10px;fill:#555">called on stable score change</text>
+  </g>
+
+  <!-- predict -->
+  <g class="node" transform="translate(710,370)">
+    <rect x="0" y="0" width="300" height="44" rx="3" />
+    <text x="150" y="16">predict(packet)</text>
+    <text x="150" y="30" style="font-size:10px;fill:#555">called every frame — returns cached result</text>
+  </g>
+
+  <!-- WinPredictionModel -->
+  <g class="node dark" transform="translate(710,460)">
+    <rect x="0" y="0" width="300" height="44" rx="3" />
+    <text x="150" y="22">WinPredictionModel (black box)</text>
+  </g>
+
+  <!-- PredictionResult -->
+  <g class="node" transform="translate(710,610)">
+    <rect x="0" y="0" width="300" height="44" rx="3" />
+    <text x="150" y="16">PredictionResult</text>
+    <text x="150" y="30" style="font-size:10px;fill:#555">player1_win_prob · confidence · model_ready</text>
+  </g>
+
+  <!-- draw_prediction_overlay -->
+  <g class="node dark" transform="translate(710,670)">
+    <rect x="0" y="0" width="300" height="44" rx="3" />
+    <text x="150" y="22">draw_prediction_overlay(frame, result)</text>
+  </g>
+
+  <!-- ===== EDGES ===== -->
+
+  <!-- Input source -> frame_producer_thread -->
+  <g class="edge">
+    <line x1="120" y1="84" x2="120" y2="160" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- frame_producer_thread -> Scene gate -->
+  <g class="edge">
+    <line x1="210" y1="182" x2="240" y2="182" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- Scene gate -> skip back (loop) -->
+  <g class="edge">
+    <path d="M320,160 Q320,130 270,130 Q220,130 210,155" marker-end="url(#arrow)" stroke-dasharray="4 3" />
+    <text class="edge-label" x="280" y="124">skip</text>
+  </g>
+
+  <!-- Scene gate -> Table tracker -->
+  <g class="edge">
+    <line x1="320" y1="204" x2="320" y2="240" marker-end="url(#arrow)" />
+    <text class="edge-label" x="326" y="226">process</text>
+  </g>
+
+  <!-- Table tracker -> BallTracker -->
+  <g class="edge">
+    <line x1="320" y1="284" x2="320" y2="320" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- BallTracker -> PoseFeatureExtractor -->
+  <g class="edge">
+    <line x1="280" y1="364" x2="170" y2="400" marker-end="url(#arrow)" />
+    <text class="edge-label" x="186" y="390">frame</text>
+  </g>
+
+  <!-- BallTracker -> ScoreDetector -->
+  <g class="edge">
+    <line x1="320" y1="364" x2="320" y2="400" marker-end="url(#arrow)" />
+    <text class="edge-label" x="326" y="386">frame</text>
+  </g>
+
+  <!-- BallTracker -> RallyAggregator -->
+  <g class="edge">
+    <line x1="370" y1="364" x2="490" y2="400" marker-end="url(#arrow)" />
+    <text class="edge-label" x="420" y="386">tracks + meters</text>
+  </g>
+
+  <!-- PoseFeatureExtractor -> build_packet -->
+  <g class="edge">
+    <line x1="120" y1="444" x2="280" y2="490" marker-end="url(#arrow)" />
+    <text class="edge-label" x="148" y="476">pose features</text>
+  </g>
+
+  <!-- ScoreDetector -> build_packet -->
+  <g class="edge">
+    <line x1="320" y1="444" x2="330" y2="490" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- RallyAggregator -> build_packet -->
+  <g class="edge">
+    <line x1="490" y1="444" x2="420" y2="490" marker-end="url(#arrow)" />
+    <text class="edge-label" x="458" y="476">rally state</text>
+  </g>
+
+  <!-- BallTracker -> build_packet (tracks/speed) -->
+  <g class="edge">
+    <path d="M400,342 Q460,342 460,512 Q460,512 420,512" marker-end="url(#arrow)" stroke-dasharray="4 3" />
+    <text class="edge-label" x="462" y="430">ball state</text>
+  </g>
+
+  <!-- build_packet -> PredictionDataPacket -->
+  <g class="edge">
+    <line x1="420" y1="512" x2="710" y2="222" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- PredictionDataPacket -> on_point_scored -->
+  <g class="edge">
+    <line x1="860" y1="244" x2="860" y2="290" marker-end="url(#arrow)" />
+    <text class="edge-label" x="866" y="272">on score change</text>
+  </g>
+
+  <!-- PredictionDataPacket -> predict -->
+  <g class="edge">
+    <path d="M1010,244 Q1040,244 1040,392 Q1040,392 1010,392" marker-end="url(#arrow)" stroke-dasharray="4 3" />
+    <text class="edge-label" x="1016" y="320">every frame</text>
+  </g>
+
+  <!-- on_point_scored -> WinPredictionModel -->
+  <g class="edge">
+    <line x1="860" y1="334" x2="860" y2="460" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- predict -> WinPredictionModel -->
+  <g class="edge">
+    <line x1="860" y1="414" x2="860" y2="460" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- WinPredictionModel -> PredictionResult -->
+  <g class="edge">
+    <line x1="860" y1="504" x2="860" y2="610" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- PredictionResult -> draw_prediction_overlay -->
+  <g class="edge">
+    <line x1="860" y1="654" x2="860" y2="670" marker-end="url(#arrow)" />
+  </g>
+
+</svg>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-box dark"></div> Key processing node</div>
+  <div class="legend-item"><div class="legend-box"></div> Supporting component</div>
+  <div class="legend-item"><div class="legend-box dashed"></div> Optional / grouped boundary</div>
+</div>
+
+</body>
+</html>

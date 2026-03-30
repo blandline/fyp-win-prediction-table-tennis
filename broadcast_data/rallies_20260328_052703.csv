@@ -1,1 +1,0 @@
-rally_id,rally_start_frame,rally_end_frame,rally_start_time,rally_end_time,p1_score_start,p2_score_start,p1_sets_start,p2_sets_start,mean_speed_mps,max_speed_mps,speed_std_mps,landing_zone_0,landing_zone_1,landing_zone_2,landing_zone_3,landing_zone_4,landing_zone_5,landing_zone_6,landing_zone_7,landing_zone_8,point_winner,skipped

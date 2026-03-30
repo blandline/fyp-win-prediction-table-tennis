@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Broadcast Pipeline — Per-Frame Sequence</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #ffffff;
+      color: #000000;
+      font-family: "Segoe UI", Arial, sans-serif;
+      font-size: 13px;
+      padding: 40px;
+    }
+
+    h1 {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      border-bottom: 2px solid #000;
+      padding-bottom: 10px;
+      margin-bottom: 8px;
+    }
+
+    .subtitle {
+      font-size: 12px;
+      color: #444;
+      margin-bottom: 40px;
+    }
+
+    svg {
+      display: block;
+      overflow: visible;
+    }
+
+    text {
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+
+    /* lifeline headers */
+    .actor rect {
+      fill: #000000;
+      stroke: none;
+    }
+    .actor text {
+      fill: #ffffff;
+      font-size: 10px;
+      font-weight: 600;
+      text-anchor: middle;
+      dominant-baseline: middle;
+    }
+
+    /* lifeline dashed vertical */
+    .lifeline {
+      stroke: #aaaaaa;
+      stroke-width: 1px;
+      stroke-dasharray: 4 3;
+    }
+
+    /* message arrows */
+    .msg line, .msg path {
+      stroke: #000000;
+      stroke-width: 1.5px;
+      fill: none;
+    }
+    .msg-return line, .msg-return path {
+      stroke: #555555;
+      stroke-width: 1px;
+      stroke-dasharray: 4 3;
+      fill: none;
+    }
+    .msg-label {
+      font-size: 10px;
+      fill: #000000;
+    }
+    .msg-label-return {
+      font-size: 10px;
+      fill: #555555;
+    }
+
+    /* alt/loop box */
+    .alt-box rect {
+      fill: none;
+      stroke: #000000;
+      stroke-width: 1px;
+      stroke-dasharray: 5 3;
+    }
+    .alt-box text {
+      font-size: 10px;
+      fill: #000000;
+      font-weight: 600;
+    }
+    .alt-label {
+      font-size: 10px;
+      fill: #555555;
+      font-style: italic;
+    }
+
+    /* note box */
+    .note rect {
+      fill: #f5f5f5;
+      stroke: #aaaaaa;
+      stroke-width: 1px;
+    }
+    .note text {
+      font-size: 10px;
+      fill: #333333;
+    }
+
+    .legend {
+      margin-top: 40px;
+      border-top: 1px solid #ccc;
+      padding-top: 16px;
+      display: flex;
+      gap: 32px;
+      flex-wrap: wrap;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: #333;
+    }
+    .legend-line {
+      width: 36px;
+      height: 2px;
+      background: #000;
+    }
+    .legend-line.dashed {
+      background: repeating-linear-gradient(to right, #555 0, #555 4px, transparent 4px, transparent 7px);
+      height: 1px;
+    }
+  </style>
+</head>
+<body>
+
+<h1>Broadcast Pipeline — Per-Frame Sequence of Calls</h1>
+<p class="subtitle">Execution order inside the main loop of broadcast_data_collector.py for a single processed frame</p>
+
+<svg width="1060" height="900" viewBox="0 0 1060 900">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#000" />
+    </marker>
+    <marker id="arrow-gray" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#555" />
+    </marker>
+  </defs>
+
+  <!-- ── Actor x-positions (centre of lifeline) ── -->
+  <!-- Prod=60  Loop=180  Ball=310  Pose=430  Score=550  Rally=670  Pkt=790  Model=930 -->
+
+  <!-- ===== ACTOR HEADERS ===== -->
+  <g class="actor" transform="translate(10,20)">
+    <rect x="0" y="0" width="100" height="36" rx="2" />
+    <text x="50" y="18">frame_producer</text>
+  </g>
+  <g class="actor" transform="translate(130,20)">
+    <rect x="0" y="0" width="100" height="36" rx="2" />
+    <text x="50" y="18">Main Loop</text>
+  </g>
+  <g class="actor" transform="translate(260,20)">
+    <rect x="0" y="0" width="100" height="36" rx="2" />
+    <text x="50" y="18">BallTracker</text>
+  </g>
+  <g class="actor" transform="translate(390,20)">
+    <rect x="0" y="0" width="100" height="36" rx="2" />
+    <text x="50" y="10">PoseFeature</text>
+    <text x="50" y="26">Extractor</text>
+  </g>
+  <g class="actor" transform="translate(520,20)">
+    <rect x="0" y="0" width="100" height="36" rx="2" />
+    <text x="50" y="10">Score</text>
+    <text x="50" y="26">Detector</text>
+  </g>
+  <g class="actor" transform="translate(650,20)">
+    <rect x="0" y="0" width="100" height="36" rx="2" />
+    <text x="50" y="10">Rally</text>
+    <text x="50" y="26">Aggregator</text>
+  </g>
+  <g class="actor" transform="translate(780,20)">
+    <rect x="0" y="0" width="100" height="36" rx="2" />
+    <text x="50" y="10">build_packet</text>
+    <text x="50" y="26">()</text>
+  </g>
+  <g class="actor" transform="translate(910,20)">
+    <rect x="0" y="0" width="130" height="36" rx="2" />
+    <text x="65" y="10">WinPrediction</text>
+    <text x="65" y="26">Model</text>
+  </g>
+
+  <!-- ===== LIFELINES ===== -->
+  <line class="lifeline" x1="60"  y1="56" x2="60"  y2="880" />
+  <line class="lifeline" x1="180" y1="56" x2="180" y2="880" />
+  <line class="lifeline" x1="310" y1="56" x2="310" y2="880" />
+  <line class="lifeline" x1="440" y1="56" x2="440" y2="880" />
+  <line class="lifeline" x1="570" y1="56" x2="570" y2="880" />
+  <line class="lifeline" x1="700" y1="56" x2="700" y2="880" />
+  <line class="lifeline" x1="830" y1="56" x2="830" y2="880" />
+  <line class="lifeline" x1="975" y1="56" x2="975" y2="880" />
+
+  <!-- ===== MESSAGES ===== -->
+
+  <!-- 1. frame_producer -> Main Loop: (frame_idx, frame) -->
+  <g class="msg">
+    <line x1="60" y1="100" x2="172" y2="100" marker-end="url(#arrow)" />
+  </g>
+  <text class="msg-label" x="64" y="95">(frame_idx, frame)</text>
+
+  <!-- 2. Main Loop -> BallTracker: detect_and_track(frame) -->
+  <g class="msg">
+    <line x1="180" y1="140" x2="302" y2="140" marker-end="url(#arrow)" />
+  </g>
+  <text class="msg-label" x="184" y="135">detect_and_track(frame)</text>
+  <!-- return -->
+  <g class="msg-return">
+    <line x1="310" y1="158" x2="188" y2="158" marker-end="url(#arrow-gray)" />
+  </g>
+  <text class="msg-label-return" x="220" y="153">tracks</text>
+
+  <!-- 3. Main Loop -> PoseFeatureExtractor (throttled) -->
+  <g class="msg">
+    <line x1="180" y1="200" x2="432" y2="200" marker-end="url(#arrow)" />
+  </g>
+  <text class="msg-label" x="184" y="195">update(frame, pid)  [every pose_interval]</text>
+  <!-- return -->
+  <g class="msg-return">
+    <line x1="440" y1="218" x2="188" y2="218" marker-end="url(#arrow-gray)" />
+  </g>
+  <text class="msg-label-return" x="280" y="213">pose_p1_latest, pose_p2_latest</text>
+
+  <!-- 4. Main Loop -> ScoreDetector (throttled) -->
+  <g class="msg">
+    <line x1="180" y1="260" x2="562" y2="260" marker-end="url(#arrow)" />
+  </g>
+  <text class="msg-label" x="184" y="255">update_scores_and_rounds(frame)  [every score_interval]</text>
+  <!-- return -->
+  <g class="msg-return">
+    <line x1="570" y1="278" x2="188" y2="278" marker-end="url(#arrow-gray)" />
+  </g>
+  <text class="msg-label-return" x="300" y="273">current_scores, rounds, stable_scores</text>
+
+  <!-- 5. Main Loop -> RallyAggregator: add_frame -->
+  <g class="msg">
+    <line x1="180" y1="320" x2="692" y2="320" marker-end="url(#arrow)" />
+  </g>
+  <text class="msg-label" x="184" y="315">add_frame(frame_idx, tracks_with_meters, stable_scores, rounds)</text>
+  <!-- return -->
+  <g class="msg-return">
+    <line x1="700" y1="338" x2="188" y2="338" marker-end="url(#arrow-gray)" />
+  </g>
+  <text class="msg-label-return" x="420" y="333">rally state + samples updated</text>
+
+  <!-- NOTE: stable_scores check -->
+  <g class="note" transform="translate(184,360)">
+    <rect x="0" y="0" width="480" height="26" rx="2" />
+    <text x="10" y="17">Main Loop checks: did stable_scores change since last frame?  (point confirmed)</text>
+  </g>
+
+  <!-- 6. Main Loop -> build_packet -->
+  <g class="msg">
+    <line x1="180" y1="410" x2="822" y2="410" marker-end="url(#arrow)" />
+  </g>
+  <text class="msg-label" x="184" y="405">build_packet(ball_tracker, tracks, score_detector, rally_aggregator, pose_p1, pose_p2)</text>
+  <!-- return -->
+  <g class="msg-return">
+    <line x1="830" y1="428" x2="188" y2="428" marker-end="url(#arrow-gray)" />
+  </g>
+  <text class="msg-label-return" x="480" y="423">PredictionDataPacket</text>
+
+  <!-- ALT box: point confirmed -->
+  <g class="alt-box" transform="translate(184,450)">
+    <rect x="0" y="0" width="820" height="80" rx="2" />
+    <text x="8" y="14">alt</text>
+    <text class="alt-label" x="36" y="14">stable score changed (point confirmed)</text>
+    <!-- divider -->
+    <line x1="0" y1="20" x2="820" y2="20" stroke="#000" stroke-width="0.5" />
+  </g>
+
+  <!-- 7. on_point_scored -->
+  <g class="msg">
+    <line x1="180" y1="480" x2="967" y2="480" marker-end="url(#arrow)" />
+  </g>
+  <text class="msg-label" x="184" y="475">on_point_scored(packet)</text>
+  <text class="msg-label" x="700" y="475" style="font-size:9px;fill:#555">(triggers model update, caches new result)</text>
+
+  <!-- 8. predict (every frame) -->
+  <g class="msg">
+    <line x1="180" y1="560" x2="967" y2="560" marker-end="url(#arrow)" />
+  </g>
+  <text class="msg-label" x="184" y="555">predict(packet)  [every frame / predict_interval]</text>
+  <!-- return -->
+  <g class="msg-return">
+    <line x1="975" y1="578" x2="188" y2="578" marker-end="url(#arrow-gray)" />
+  </g>
+  <text class="msg-label-return" x="540" y="573">PredictionResult  (cached — returns instantly)</text>
+
+  <!-- 9. draw_prediction_overlay -->
+  <g class="msg">
+    <line x1="180" y1="630" x2="172" y2="630" />
+    <path d="M180,620 Q160,620 160,630 Q160,640 180,640" stroke="#000" stroke-width="1.5" fill="none" marker-end="url(#arrow)" />
+  </g>
+  <text class="msg-label" x="184" y="625">draw_prediction_overlay(frame, last_prediction)</text>
+  <text class="msg-label" x="184" y="645" style="font-size:9px;fill:#555">win-probability bars drawn onto frame in-place</text>
+
+  <!-- 10. cv2.imshow -->
+  <g class="msg">
+    <line x1="180" y1="690" x2="68" y2="690" marker-end="url(#arrow)" />
+  </g>
+  <text class="msg-label" x="184" y="685">cv2.imshow(annotated frame)</text>
+
+  <!-- 11. video_writer_thread (optional) -->
+  <g class="msg-return">
+    <line x1="180" y1="730" x2="68" y2="730" marker-end="url(#arrow-gray)" />
+  </g>
+  <text class="msg-label-return" x="184" y="725">write_queue.put(frame)  [async video writer, optional]</text>
+
+  <!-- 12. DataLogger CSVs -->
+  <g class="msg-return">
+    <line x1="180" y1="770" x2="68" y2="770" marker-end="url(#arrow-gray)" />
+  </g>
+  <text class="msg-label-return" x="184" y="765">DataLogger: log_trajectory / log_pose / log_score / log_rally  (CSVs)</text>
+
+</svg>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-line"></div> Call (solid)</div>
+  <div class="legend-item"><div class="legend-line dashed"></div> Return / async (dashed)</div>
+</div>
+
+</body>
+</html>

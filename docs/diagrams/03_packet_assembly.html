@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Broadcast Pipeline — Packet Assembly</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #ffffff;
+      color: #000000;
+      font-family: "Segoe UI", Arial, sans-serif;
+      font-size: 13px;
+      padding: 40px;
+    }
+
+    h1 {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      border-bottom: 2px solid #000;
+      padding-bottom: 10px;
+      margin-bottom: 8px;
+    }
+
+    .subtitle {
+      font-size: 12px;
+      color: #444;
+      margin-bottom: 40px;
+    }
+
+    svg {
+      display: block;
+      overflow: visible;
+    }
+
+    text {
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+
+    .legend {
+      margin-top: 40px;
+      border-top: 1px solid #ccc;
+      padding-top: 16px;
+      display: flex;
+      gap: 32px;
+      flex-wrap: wrap;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: #333;
+    }
+    .legend-box {
+      width: 28px;
+      height: 16px;
+      border: 1.5px solid #000;
+      background: #fff;
+    }
+    .legend-box.dark { background: #000; }
+    .legend-box.mid  { background: #555; }
+  </style>
+</head>
+<body>
+
+<h1>Broadcast Pipeline — Packet Assembly &amp; Prediction Interface</h1>
+<p class="subtitle">
+  How build_packet() assembles a PredictionDataPacket from live CV state,
+  and how WinPredictionModel consumes it
+</p>
+
+<svg width="1060" height="760" viewBox="0 0 1060 760">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#000" />
+    </marker>
+    <marker id="arr-gray" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#555" />
+    </marker>
+  </defs>
+
+  <!-- ================================================================
+       LEFT COLUMN — CV sources (5 source boxes)
+  ================================================================ -->
+
+  <!-- ── BallTracker ── -->
+  <rect x="20" y="40" width="220" height="120" rx="3" fill="#fff" stroke="#000" stroke-width="1.5" />
+  <rect x="20" y="40" width="220" height="26" rx="3" fill="#000" />
+  <text x="130" y="57" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">BallTracker</text>
+  <text x="30" y="86"  fill="#333" font-size="10">detected: bool</text>
+  <text x="30" y="100" fill="#333" font-size="10">position_px: (cx, cy) pixels</text>
+  <text x="30" y="114" fill="#333" font-size="10">position_m: (x_m, y_m) metres</text>
+  <text x="30" y="128" fill="#333" font-size="10">speed_mps: smoothed median m/s</text>
+  <text x="30" y="142" fill="#333" font-size="10">trajectory_px: deque of last N (x,y)</text>
+
+  <!-- ── ScoreDetector ── -->
+  <rect x="20" y="190" width="220" height="106" rx="3" fill="#fff" stroke="#000" stroke-width="1.5" />
+  <rect x="20" y="190" width="220" height="26" rx="3" fill="#000" />
+  <text x="130" y="207" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">ScoreDetector / ManualScoreTracker</text>
+  <text x="30" y="232" fill="#333" font-size="10">player1_score, player2_score: int</text>
+  <text x="30" y="246" fill="#333" font-size="10">player1_sets, player2_sets: int</text>
+  <text x="30" y="260" fill="#333" font-size="10">score_reliable: bool (OCR obscured?)</text>
+  <text x="30" y="274" fill="#555" font-size="9" font-style="italic">stable_scores used for point boundary detection</text>
+
+  <!-- ── RallyAggregator ── -->
+  <rect x="20" y="326" width="220" height="120" rx="3" fill="#fff" stroke="#000" stroke-width="1.5" />
+  <rect x="20" y="326" width="220" height="26" rx="3" fill="#000" />
+  <text x="130" y="343" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">RallyAggregator</text>
+  <text x="30" y="370" fill="#333" font-size="10">is_active: bool (ball in play?)</text>
+  <text x="30" y="384" fill="#333" font-size="10">rally_id: int</text>
+  <text x="30" y="398" fill="#333" font-size="10">rally_duration_sec: float</text>
+  <text x="30" y="412" fill="#333" font-size="10">mean_speed_mps, max_speed_mps</text>
+  <text x="30" y="426" fill="#333" font-size="10">landing_zones: int[9]  (3x3 grid)</text>
+
+  <!-- ── PoseFeatureExtractor ── -->
+  <rect x="20" y="476" width="220" height="134" rx="3" fill="#fff" stroke="#000" stroke-width="1.5" />
+  <rect x="20" y="476" width="220" height="26" rx="3" fill="#000" />
+  <text x="130" y="493" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">PoseFeatureExtractor</text>
+  <text x="30" y="520" fill="#333" font-size="10">visibility_mean, visibility_min</text>
+  <text x="30" y="534" fill="#333" font-size="10">angle_trunk_lean, angle_elbow_dom</text>
+  <text x="30" y="548" fill="#333" font-size="10">com_height, hand_height, stance_length</text>
+  <text x="30" y="562" fill="#333" font-size="10">v_hand_speed, v_torso_x, v_com_y</text>
+  <text x="30" y="576" fill="#555" font-size="9" font-style="italic">per player — debug_landmarks stripped</text>
+  <text x="30" y="590" fill="#555" font-size="9" font-style="italic">before sending to model</text>
+
+  <!-- ── Timestamps ── -->
+  <rect x="20" y="640" width="220" height="80" rx="3" fill="#fff" stroke="#000" stroke-width="1.5" />
+  <rect x="20" y="640" width="220" height="26" rx="3" fill="#555" />
+  <text x="130" y="657" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">Frame / Time metadata</text>
+  <text x="30" y="682" fill="#333" font-size="10">frame_idx: int</text>
+  <text x="30" y="696" fill="#333" font-size="10">timestamp_sec: frame_idx / fps</text>
+  <text x="30" y="710" fill="#333" font-size="10">match_elapsed_sec: wall-clock time</text>
+
+  <!-- ================================================================
+       CENTRE — build_packet() + PredictionDataPacket
+  ================================================================ -->
+
+  <!-- build_packet box -->
+  <rect x="310" y="300" width="180" height="44" rx="3" fill="#000" stroke="none" />
+  <text x="400" y="318" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">build_packet()</text>
+  <text x="400" y="334" fill="#aaa" font-size="10" text-anchor="middle">prediction_pipeline.py</text>
+
+  <!-- PredictionDataPacket box -->
+  <rect x="310" y="390" width="180" height="230" rx="3" fill="#fff" stroke="#000" stroke-width="2" />
+  <rect x="310" y="390" width="180" height="26" rx="3" fill="#000" />
+  <text x="400" y="407" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">PredictionDataPacket</text>
+
+  <text x="320" y="432" fill="#555" font-size="9" font-weight="600">BallState</text>
+  <text x="320" y="446" fill="#333" font-size="9">  detected, position_px/m, speed, traj</text>
+
+  <text x="320" y="464" fill="#555" font-size="9" font-weight="600">ScoreState</text>
+  <text x="320" y="478" fill="#333" font-size="9">  scores, sets, score_reliable</text>
+
+  <text x="320" y="496" fill="#555" font-size="9" font-weight="600">RallyState</text>
+  <text x="320" y="510" fill="#333" font-size="9">  is_active, duration, speeds, zones</text>
+
+  <text x="320" y="528" fill="#555" font-size="9" font-weight="600">PoseState</text>
+  <text x="320" y="542" fill="#333" font-size="9">  player1: dict  |  player2: dict</text>
+
+  <text x="320" y="560" fill="#555" font-size="9" font-weight="600">Metadata</text>
+  <text x="320" y="574" fill="#333" font-size="9">  frame_idx, timestamp_sec</text>
+  <text x="320" y="588" fill="#333" font-size="9">  match_elapsed_sec</text>
+
+  <!-- ================================================================
+       RIGHT COLUMN — WinPredictionModel interface + output
+  ================================================================ -->
+
+  <!-- WinPredictionModel (abstract) -->
+  <rect x="570" y="200" width="240" height="120" rx="3" fill="#fff" stroke="#000" stroke-width="1.5" stroke-dasharray="6 3" />
+  <rect x="570" y="200" width="240" height="26" rx="3" fill="#555" />
+  <text x="690" y="217" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">WinPredictionModel  (abstract)</text>
+  <text x="580" y="244" fill="#333" font-size="10">predict(packet)  →  PredictionResult</text>
+  <text x="580" y="258" fill="#555" font-size="9" font-style="italic">  must return in &lt;5 ms; returns cached result</text>
+  <text x="580" y="276" fill="#333" font-size="10">on_point_scored(packet)</text>
+  <text x="580" y="290" fill="#555" font-size="9" font-style="italic">  called on stable score change; triggers inference</text>
+  <text x="580" y="308" fill="#333" font-size="10">reset()</text>
+
+  <!-- XGBoostWinPredictor -->
+  <rect x="570" y="360" width="240" height="100" rx="3" fill="#fff" stroke="#000" stroke-width="1.5" />
+  <rect x="570" y="360" width="240" height="26" rx="3" fill="#000" />
+  <text x="690" y="377" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">XGBoostWinPredictor</text>
+  <text x="580" y="400" fill="#333" font-size="10">Buffers pose per rally</text>
+  <text x="580" y="414" fill="#333" font-size="10">Builds 19-feature vector on point scored</text>
+  <text x="580" y="428" fill="#333" font-size="10">Runs xgb_model.pkl  →  caches result</text>
+  <text x="580" y="444" fill="#555" font-size="9" font-style="italic">CV Pipeline/xgb_model.pkl</text>
+
+  <!-- LateFusionWinPredictor -->
+  <rect x="570" y="500" width="240" height="116" rx="3" fill="#fff" stroke="#000" stroke-width="1.5" />
+  <rect x="570" y="500" width="240" height="26" rx="3" fill="#000" />
+  <text x="690" y="517" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">LateFusionWinPredictor</text>
+  <text x="580" y="540" fill="#333" font-size="10">Wraps XGBoostWinPredictor (cv_prob)</text>
+  <text x="580" y="554" fill="#333" font-size="10">+ static profile_prob (ITTF Elo/H2H)</text>
+  <text x="580" y="568" fill="#333" font-size="10">Fuses via late_fusion_model.pkl</text>
+  <text x="580" y="582" fill="#555" font-size="9" font-style="italic">  or weighted average fallback</text>
+  <text x="580" y="598" fill="#555" font-size="9" font-style="italic">Player_Profile/tt_model_2026.pkl</text>
+
+  <!-- PredictionResult -->
+  <rect x="570" y="660" width="240" height="80" rx="3" fill="#fff" stroke="#000" stroke-width="2" />
+  <rect x="570" y="660" width="240" height="26" rx="3" fill="#000" />
+  <text x="690" y="677" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">PredictionResult</text>
+  <text x="580" y="702" fill="#333" font-size="10">player1_win_prob: float  (0–1)</text>
+  <text x="580" y="716" fill="#333" font-size="10">player2_win_prob: float  (0–1)</text>
+  <text x="580" y="730" fill="#333" font-size="10">confidence: float  |  model_ready: bool</text>
+
+  <!-- draw_prediction_overlay -->
+  <rect x="820" y="660" width="220" height="80" rx="3" fill="#000" stroke="none" />
+  <text x="930" y="694" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">draw_prediction_overlay</text>
+  <text x="930" y="710" fill="#aaa" font-size="10" text-anchor="middle">(frame, result)</text>
+  <text x="930" y="726" fill="#aaa" font-size="10" text-anchor="middle">win-prob bars on video frame</text>
+
+  <!-- ================================================================
+       ARROWS — sources to build_packet
+  ================================================================ -->
+  <line x1="240" y1="100"  x2="310" y2="322" stroke="#000" stroke-width="1.5" marker-end="url(#arr)" />
+  <line x1="240" y1="243"  x2="310" y2="322" stroke="#000" stroke-width="1.5" marker-end="url(#arr)" />
+  <line x1="240" y1="386"  x2="310" y2="322" stroke="#000" stroke-width="1.5" marker-end="url(#arr)" />
+  <line x1="240" y1="543"  x2="310" y2="344" stroke="#000" stroke-width="1.5" marker-end="url(#arr)" />
+  <line x1="240" y1="680"  x2="310" y2="344" stroke="#000" stroke-width="1.5" marker-end="url(#arr)" />
+
+  <!-- build_packet -> PredictionDataPacket -->
+  <line x1="400" y1="344" x2="400" y2="390" stroke="#000" stroke-width="1.5" marker-end="url(#arr)" />
+
+  <!-- PredictionDataPacket -> WinPredictionModel (abstract) -->
+  <line x1="490" y1="505" x2="570" y2="310" stroke="#000" stroke-width="1.5" marker-end="url(#arr)" />
+  <text x="510" y="420" fill="#333" font-size="10">packet</text>
+
+  <!-- WinPredictionModel -> XGBoostWinPredictor -->
+  <line x1="690" y1="320" x2="690" y2="360" stroke="#555" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#arr-gray)" />
+  <text x="696" y="344" fill="#555" font-size="9">implements</text>
+
+  <!-- WinPredictionModel -> LateFusionWinPredictor -->
+  <line x1="690" y1="320" x2="690" y2="500" stroke="#555" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#arr-gray)" />
+
+  <!-- XGBoostWinPredictor -> PredictionResult -->
+  <line x1="690" y1="460" x2="690" y2="660" stroke="#000" stroke-width="1.5" marker-end="url(#arr)" />
+
+  <!-- LateFusionWinPredictor -> PredictionResult -->
+  <line x1="710" y1="616" x2="710" y2="660" stroke="#000" stroke-width="1.5" marker-end="url(#arr)" />
+
+  <!-- PredictionResult -> draw_prediction_overlay -->
+  <line x1="810" y1="700" x2="820" y2="700" stroke="#000" stroke-width="1.5" marker-end="url(#arr)" />
+
+</svg>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-box dark"></div> Key processing node</div>
+  <div class="legend-item"><div class="legend-box mid"></div> Supporting / metadata node</div>
+  <div class="legend-item"><div class="legend-box"></div> Data structure / component</div>
+</div>
+
+</body>
+</html>

@@ -1,3 +1,7 @@
+# Pytest temporary files
+.pytest_tmp/
+.pytest_cache/
+
 # Model weights
 *.pt
 *.pth
