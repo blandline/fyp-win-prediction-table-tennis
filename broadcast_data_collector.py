@@ -68,6 +68,8 @@ from ball_tracking_fast import (
     END_SENTINEL,
     _parse_inference_size,
 )
+from prediction_model_base import PredictionResult
+from prediction_pipeline import load_prediction_model, build_packet, draw_prediction_overlay
 
 
 # =============================================================================
@@ -238,6 +240,7 @@ def collect(
     player_names=None,
     broadcast_model=None,
     score_interval_sec=2.0,
+    prediction_model=None,
 ):
     """Main data collection loop."""
     # ------------------------------------------------------------------
@@ -334,6 +337,12 @@ def collect(
     logger.save_config(rois, video_path, fps, table_corners=table_corners)
     print("  Models loaded!")
 
+    if prediction_model is not None:
+        prediction_model.reset()
+        print(f"  Prediction model: {type(prediction_model).__name__}")
+    else:
+        print("  Prediction model: none (disabled)")
+
     pose_interval = max(1, int(fps / POSE_TARGET_FPS))
     score_detect_interval = max(1, int(fps * score_interval_sec))
 
@@ -383,6 +392,13 @@ def collect(
     sides_swapped = False
     score_freeze_until_frame = 0
     skipped_frames = 0
+
+    # Prediction model state
+    last_stable_scores_pred = (None, None)
+    last_prediction = PredictionResult()
+    pose_p1_latest = None
+    pose_p2_latest = None
+    start_time = time.time()
 
     print("\nBroadcast data collection started.")
     print("  Q=Quit  P=Pause  +/-=Speed  S=Screenshot  X=SwapSides  R=Re-mark corners")
@@ -563,6 +579,10 @@ def collect(
                     )
                     if feat is not None:
                         logger.log_pose(feat)
+                        if pid == 1:
+                            pose_p1_latest = feat
+                        else:
+                            pose_p2_latest = feat
                         lm_px = feat.get('debug_landmarks')
                         if lm_px:
                             color = (0, 255, 0) if pid == 1 else (255, 0, 0)
@@ -589,6 +609,25 @@ def collect(
             )
             stats.rally_display = rally_aggregator.get_state_for_display()
 
+            # ---- Win prediction ----
+            if prediction_model is not None:
+                current_stable_pred = (
+                    score_detector.stable_scores.get('player1'),
+                    score_detector.stable_scores.get('player2'),
+                )
+                packet = build_packet(
+                    frame_idx, fps, ball_tracker, tracks, score_detector,
+                    rally_aggregator, pose_p1_latest, pose_p2_latest, start_time,
+                )
+                if (
+                    current_stable_pred[0] is not None
+                    and current_stable_pred != last_stable_scores_pred
+                    and last_stable_scores_pred[0] is not None
+                ):
+                    prediction_model.on_point_scored(packet)
+                last_stable_scores_pred = current_stable_pred
+                last_prediction = prediction_model.predict(packet)
+
             # ---- Drawing ----
             t0 = time.perf_counter()
             ball_tracker.draw_trajectories(frame, tracks)
@@ -604,6 +643,8 @@ def collect(
                 )
                 last_score_log = current_score_log
             score_detector.draw_scores(frame, rois, player_names=player_names)
+            if prediction_model is not None:
+                draw_prediction_overlay(frame, last_prediction, player_names=player_names)
 
             _draw_scene_overlay(frame, scene_gate, skipped_frames)
             _draw_rally_overlay(frame, rally_aggregator)
@@ -723,6 +764,16 @@ Keyboard controls (OpenCV window):
                         help="Starting set counts, e.g. 1,2 (default: 0,0)")
     parser.add_argument("--player-names", metavar="NAME1,NAME2", default=None,
                         help="Player display names, e.g. Alice,Bob")
+    parser.add_argument("--prediction-model", metavar="PATH", default=None,
+                        help="Path to Python file containing a WinPredictionModel subclass "
+                             "(e.g. xgb_win_predictor.py). Omit to disable win prediction.")
+    parser.add_argument("--ittf-name1", metavar="NAME", default=None,
+                        help="ITTF-format name of Player 1 for late fusion profile lookup, "
+                             "e.g. 'CALDERANO Hugo'. Substring match is supported.")
+    parser.add_argument("--ittf-name2", metavar="NAME", default=None,
+                        help="ITTF-format name of Player 2 for late fusion profile lookup.")
+    parser.add_argument("--sets-to-win", metavar="N", type=int, default=3,
+                        help="Number of sets needed to win the match (default: 3, i.e. Best of 5).")
 
     parser.set_defaults(async_write=True)
     args = parser.parse_args()
@@ -732,6 +783,31 @@ Keyboard controls (OpenCV window):
     p1r, p2r = args.initial_rounds.split(",")
     init_rounds = {"player1": int(p1r), "player2": int(p2r)}
     player_names = args.player_names.split(",") if args.player_names else None
+
+    pred_model = None
+    if args.prediction_model:
+        from pathlib import Path as _Path
+        pred_script = _Path(args.prediction_model).resolve()
+
+        # LateFusionWinPredictor needs ITTF names at construction time —
+        # load it directly rather than via load_prediction_model() so we can
+        # pass constructor arguments.
+        if pred_script.stem == "late_fusion_win_predictor":
+            import importlib.util as _ilu
+            _spec = _ilu.spec_from_file_location("late_fusion_win_predictor", str(pred_script))
+            _mod  = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            ittf1 = args.ittf_name1 or (player_names[0] if player_names else "Player 1")
+            ittf2 = args.ittf_name2 or (player_names[1] if player_names else "Player 2")
+            pred_model = _mod.LateFusionWinPredictor(
+                ittf_name1=ittf1,
+                ittf_name2=ittf2,
+                player_names=player_names,
+            )
+        else:
+            pred_model = load_prediction_model(args.prediction_model)
+            if player_names and hasattr(pred_model, '_player_names'):
+                pred_model._player_names = player_names
 
     collect(
         video_path=args.video,
@@ -747,4 +823,5 @@ Keyboard controls (OpenCV window):
         player_names=player_names,
         broadcast_model=args.broadcast_model,
         score_interval_sec=args.score_interval,
+        prediction_model=pred_model,
     )

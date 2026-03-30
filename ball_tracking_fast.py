@@ -371,9 +371,14 @@ class ManualScoreTracker:
         self.stable_scores[player]  = v
 
     def adjust_rounds(self, player, delta):
-        """Increment or decrement a player's set count."""
+        """Increment or decrement a player's set count, resetting point scores on increment."""
         v = max(0, self.rounds[player] + delta)
         self.rounds[player] = v
+        if delta > 0:
+            self.current_scores['player1'] = 0
+            self.current_scores['player2'] = 0
+            self.stable_scores['player1'] = 0
+            self.stable_scores['player2'] = 0
 
     def swap_scores(self):
         """Swap score+sets display between players (no ROI/pose change)."""

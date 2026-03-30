@@ -26,6 +26,7 @@ runs/
 # Datasets
 data/
 dataset/
+broadcast_data/
 roboflow_combined_dataset/
 segmentation_data/
 scoreboard_yolo/
@@ -36,6 +37,10 @@ digits-detect.v1i.yolov8/
 tracking_output/
 yolo_dataset/
 runs/
+CV Pipeline/
+Player_Profile/
+system_design_diagrams/
+roboflow_combined_dataset/
 # Python junk
 __pycache__/
 *.pyc

@@ -90,6 +90,17 @@ def _build_args(cfg):
     if cfg.get("broadcast_model"):
         args += ["--broadcast-model", cfg["broadcast_model"]]
 
+    if cfg.get("prediction_model"):
+        args += ["--prediction-model", cfg["prediction_model"]]
+
+    if cfg.get("ittf_name1"):
+        args += ["--ittf-name1", cfg["ittf_name1"]]
+    if cfg.get("ittf_name2"):
+        args += ["--ittf-name2", cfg["ittf_name2"]]
+
+    if cfg.get("sets_to_win"):
+        args += ["--sets-to-win", str(cfg["sets_to_win"])]
+
     return args
 
 
@@ -172,6 +183,20 @@ with col1:
     p1_name = st.text_input("Player 1 name", value="Player 1")
     p2_name = st.text_input("Player 2 name", value="Player 2")
 
+    st.subheader("3b. Match Format")
+    _best_of = st.selectbox(
+        "Best of (total sets)",
+        options=[3, 5, 7],
+        index=1,
+        help="Total number of sets in this match format (e.g. Best of 5).",
+    )
+    _sets_to_win_options = {3: 2, 5: 3, 7: 4}
+    sets_to_win = _sets_to_win_options[_best_of]
+    st.caption(
+        f"Sets needed to win: **{sets_to_win}** "
+        f"(first to {sets_to_win} sets wins the match)"
+    )
+
     st.subheader("4. Broadcast Ball Model (optional)")
     broadcast_model = st.text_input(
         "Path to fine-tuned broadcast ball model",
@@ -180,8 +205,58 @@ with col1:
              "Use the broadcast-trained model for better accuracy on TV footage.",
     )
 
+    st.subheader("5. Win Prediction (optional)")
+    _pred_mode = st.radio(
+        "Prediction mode",
+        [
+            "Disabled",
+            "CV features only",
+            "Late fusion (CV + player profile)",
+        ],
+        help=(
+            "Disabled: no win probability overlay.\n\n"
+            "CV features only: uses pose/ball/rally data from the video "
+            "(requires CV Pipeline/xgb_model.pkl).\n\n"
+            "Late fusion: combines CV features with career stats / Elo / H2H "
+            "from the ITTF player profile model "
+            "(requires CV Pipeline/late_fusion_model.pkl and "
+            "Player_Profile/*.pkl — run fusion_model_training.py first)."
+        ),
+    )
+
+    _default_cv_predictor     = str(SCRIPT_DIR / "xgb_win_predictor.py")
+    _default_fusion_predictor = str(SCRIPT_DIR / "late_fusion_win_predictor.py")
+
+    prediction_model_path = None
+    ittf_name1 = None
+    ittf_name2 = None
+
+    if _pred_mode == "CV features only":
+        prediction_model_path = _default_cv_predictor
+
+    elif _pred_mode == "Late fusion (CV + player profile)":
+        prediction_model_path = _default_fusion_predictor
+        st.caption(
+            "Enter ITTF-format names so the profile model can look up career stats. "
+            "Format: **LASTNAME Firstname** (e.g. `CALDERANO Hugo`). "
+            "A partial name works too (substring search)."
+        )
+        ittf_col1, ittf_col2 = st.columns(2)
+        with ittf_col1:
+            ittf_name1 = st.text_input(
+                "Player 1 ITTF name",
+                placeholder="CALDERANO Hugo",
+                help="Used for profile model lookup only.",
+            )
+        with ittf_col2:
+            ittf_name2 = st.text_input(
+                "Player 2 ITTF name",
+                placeholder="MOREGARD Truls",
+                help="Used for profile model lookup only.",
+            )
+
 with col2:
-    st.subheader("5. Score Mode")
+    st.subheader("6. Score Mode")
     score_mode_label = st.radio(
         "How should scores be tracked?",
         ["Auto (OCR from scoreboard)", "Manual entry (keyboard)"],
@@ -211,7 +286,7 @@ with col2:
             init_score_p2 = st.number_input("P2 starting score", min_value=0, max_value=20, value=0)
             init_rounds_p2 = st.number_input("P2 starting sets", min_value=0, max_value=7, value=0)
 
-    st.subheader("6. ROI / Table Layout")
+    st.subheader("7. ROI / Table Layout")
     roi_mode = st.radio(
         "Score region and table setup",
         ["First run — set up interactively", "Load saved layout"],
@@ -268,6 +343,13 @@ if start:
         errors.append(f"Config JSON not found: `{roi_config_path}`")
     if broadcast_model and not Path(broadcast_model).exists():
         errors.append(f"Broadcast model not found: `{broadcast_model}`")
+    if prediction_model_path and not Path(prediction_model_path).exists():
+        errors.append(f"Prediction model script not found: `{prediction_model_path}`")
+    if _pred_mode == "Late fusion (CV + player profile)":
+        if not ittf_name1:
+            errors.append("Player 1 ITTF name is required for late fusion mode.")
+        if not ittf_name2:
+            errors.append("Player 2 ITTF name is required for late fusion mode.")
 
     if errors:
         for e in errors:
@@ -284,6 +366,11 @@ if start:
             "inference_size": BALL_SIZE_OPTIONS[ball_inf_label],
             "output_size": OUTPUT_SIZE_OPTIONS[out_size_label],
             "broadcast_model": str(broadcast_model) if broadcast_model else None,
+            "prediction_model": str(prediction_model_path) if prediction_model_path else None,
+            "ittf_name1": ittf_name1.strip() if ittf_name1 else None,
+            "ittf_name2": ittf_name2.strip() if ittf_name2 else None,
+            "sets_to_win": int(sets_to_win),
+            "best_of": int(_best_of),
         }
         if score_mode == "manual":
             cfg["initial_scores"] = {"player1": int(init_score_p1), "player2": int(init_score_p2)}
