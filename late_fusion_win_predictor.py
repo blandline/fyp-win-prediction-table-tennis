@@ -71,6 +71,78 @@ _PROFILE_DATA_PATH     = _PROFILE_DIR / "processed_df.pkl"
 _PROFILE_CSV_PATH      = _PROFILE_DIR / "ittf_h2h_data_2026.csv"
 
 _DEFAULT_ELO = 1500
+_SESSION_PATH = _HERE / "broadcast_data" / "broadcast_session.json"
+
+
+# ---------------------------------------------------------------------------
+# Match progress & dynamic fusion weight helpers
+# ---------------------------------------------------------------------------
+
+def _load_sets_to_win_from_session() -> int:
+    """Read sets_to_win from broadcast_session.json, default 3."""
+    if _SESSION_PATH.exists():
+        try:
+            with open(_SESSION_PATH) as f:
+                data = json.load(f)
+            return int(data.get("sets_to_win", 3))
+        except Exception:
+            pass
+    return 3
+
+
+def _match_progress(p1_sets: int, p2_sets: int, p1_score: int, p2_score: int,
+                    sets_to_win: int) -> float:
+    """
+    Compute how far into the match we are on a 0→1 scale.
+
+    The total "work" needed to finish a match is ``sets_to_win`` sets where
+    each set is worth ~11 points.  We measure how many of those points have
+    been played (counting completed sets as 11 each) relative to the maximum
+    possible total (a match that goes the distance = ``2*sets_to_win - 1``
+    sets each lasting 11 points).
+
+    Returns a float in [0, 1] where 0 = match just started and
+    1 = someone is on match-point in a deciding set.
+    """
+    points_per_set = 11.0
+    max_sets = 2 * sets_to_win - 1
+    max_points = max_sets * points_per_set
+
+    completed_set_points = (p1_sets + p2_sets) * points_per_set
+    current_set_points = float(p1_score + p2_score)
+    total_played = completed_set_points + current_set_points
+
+    progress = min(1.0, total_played / max_points) if max_points > 0 else 0.0
+
+    # Boost progress when a player is one set away from winning
+    leading_sets = max(p1_sets, p2_sets)
+    if leading_sets == sets_to_win - 1:
+        progress = max(progress, 0.6)
+        leading_score = max(p1_score, p2_score)
+        if leading_score >= 8:
+            progress = max(progress, 0.85)
+
+    return progress
+
+
+def _dynamic_fusion_weights(progress: float,
+                            base_w_cv: float = 0.5,
+                            base_w_profile: float = 0.5) -> tuple[float, float]:
+    """
+    Shift fusion weights so that profile weight decreases and CV weight
+    increases as the match progresses.
+
+    At progress=0 the weights are (0.35, 0.65) — profile dominates.
+    At progress=1 the weights are (0.85, 0.15) — CV dominates.
+    The transition follows a smooth cubic curve.
+    """
+    t = max(0.0, min(1.0, progress))
+    t_smooth = 3 * t * t - 2 * t * t * t  # smoothstep
+
+    w_cv_min, w_cv_max = 0.35, 0.85
+    w_cv = w_cv_min + (w_cv_max - w_cv_min) * t_smooth
+    w_profile = 1.0 - w_cv
+    return w_cv, w_profile
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +322,18 @@ class LateFusionWinPredictor(WinPredictionModel):
         ittf_name2: str = "Player 2",
         player_names: Optional[list] = None,
         best_of: int = 5,
+        sets_to_win: Optional[int] = None,
     ):
         self._ittf_name1 = ittf_name1
         self._ittf_name2 = ittf_name2
         self._player_names = player_names or [ittf_name1, ittf_name2]
         self._best_of = best_of
+
+        if sets_to_win is not None:
+            self._sets_to_win = sets_to_win
+        else:
+            self._sets_to_win = _load_sets_to_win_from_session()
+        print(f"[LateFusionWinPredictor] Sets to win: {self._sets_to_win}")
 
         # Internal CV predictor (handles all per-rally pose/ball buffering)
         self._cv_predictor = XGBoostWinPredictor(player_names=self._player_names)
@@ -345,27 +424,43 @@ class LateFusionWinPredictor(WinPredictionModel):
     # Fusion logic
     # -----------------------------------------------------------------------
 
-    def _fuse(self, cv_prob: float) -> tuple[float, float]:
+    def _fuse(self, cv_prob: float,
+              p1_sets: int = 0, p2_sets: int = 0,
+              p1_score: int = 0, p2_score: int = 0) -> tuple[float, float]:
         """
         Fuse cv_prob and profile_prob into a final probability.
+
+        Weights shift dynamically: early in the match the profile (career stats,
+        Elo, H2H) dominates; as the match progresses the CV features (current
+        performance, momentum, score) take over.
+
         Returns (fused_prob, confidence).
         """
         if not self._profile_available or self._profile_prob is None:
-            # No profile — return CV-only
             confidence = float(abs(cv_prob - 0.5) * 2.0)
             return cv_prob, confidence
 
         profile_prob = self._profile_prob
 
+        progress = _match_progress(
+            p1_sets, p2_sets, p1_score, p2_score, self._sets_to_win
+        )
+        w_cv, w_profile = _dynamic_fusion_weights(progress)
+
         if self._fusion_model is not None:
             X = np.array([[cv_prob, profile_prob]])
-            fused = float(self._fusion_model.predict_proba(X)[0][1])
+            raw_fused = float(self._fusion_model.predict_proba(X)[0][1])
+            # Blend the meta-model output with dynamic weighting: the meta-
+            # model's own estimate is treated as a "fair" mix, then we shift
+            # towards CV or profile based on match progress.
+            fused = w_cv * cv_prob + w_profile * profile_prob
+            # Average with the meta-model so its learned calibration still
+            # helps when the match is young and we trust profiles more.
+            meta_weight = 1.0 - progress  # trust meta-model less as game progresses
+            fused = meta_weight * raw_fused + (1.0 - meta_weight) * fused
         else:
-            # Simple weighted average fallback
-            w_cv = float(self._fusion_weights.get("w_cv", 0.5))
-            w_pr = float(self._fusion_weights.get("w_profile", 0.5))
-            total = w_cv + w_pr
-            fused = (w_cv * cv_prob + w_pr * profile_prob) / total if total > 0 else 0.5
+            total = w_cv + w_profile
+            fused = (w_cv * cv_prob + w_profile * profile_prob) / total if total > 0 else 0.5
 
         confidence = float(abs(fused - 0.5) * 2.0)
         return fused, confidence
@@ -399,15 +494,26 @@ class LateFusionWinPredictor(WinPredictionModel):
 
         cv_prob = cv_result.player1_win_prob
 
-        # Fuse
-        fused_prob, confidence = self._fuse(cv_prob)
+        # Extract match state for dynamic weighting
+        p1_score = packet.score.player1_score or 0
+        p2_score = packet.score.player2_score or 0
+        p1_sets = packet.score.player1_sets
+        p2_sets = packet.score.player2_sets
+
+        # Fuse with match-progress-aware dynamic weights
+        fused_prob, confidence = self._fuse(
+            cv_prob, p1_sets, p2_sets, p1_score, p2_score
+        )
         p2_prob = 1.0 - fused_prob
 
         p1_name = self._player_names[0]
         p2_name = self._player_names[1]
         rally_num = len(self._cv_predictor._rally_history)
-        p1_score = packet.score.player1_score or 0
-        p2_score = packet.score.player2_score or 0
+
+        progress = _match_progress(
+            p1_sets, p2_sets, p1_score, p2_score, self._sets_to_win
+        )
+        w_cv, w_profile = _dynamic_fusion_weights(progress)
 
         if self._profile_available and self._profile_prob is not None:
             profile_prob = self._profile_prob
@@ -418,7 +524,8 @@ class LateFusionWinPredictor(WinPredictionModel):
                 f"Profile: {profile_prob * 100:.1f}% | "
                 f"FUSED ({method}): {fused_prob * 100:.1f}% | "
                 f"{p1_name} vs {p2_name} | "
-                f"Score: {p1_score}-{p2_score} | "
+                f"Sets: {p1_sets}-{p2_sets} | Score: {p1_score}-{p2_score} | "
+                f"progress: {progress:.0%} w_cv={w_cv:.2f} w_prof={w_profile:.2f} | "
                 f"conf: {confidence:.2f}"
             )
         else:
@@ -426,7 +533,7 @@ class LateFusionWinPredictor(WinPredictionModel):
                 f"[Rally {rally_num:>3}] "
                 f"CV (no profile): {cv_prob * 100:.1f}% | "
                 f"{p1_name} vs {p2_name} | "
-                f"Score: {p1_score}-{p2_score} | "
+                f"Sets: {p1_sets}-{p2_sets} | Score: {p1_score}-{p2_score} | "
                 f"conf: {confidence:.2f}"
             )
 

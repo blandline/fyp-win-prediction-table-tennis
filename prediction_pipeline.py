@@ -127,6 +127,7 @@ def load_prediction_model(model_path):
 def build_packet(
     frame_idx, fps, ball_tracker, tracks, score_detector,
     rally_aggregator, pose_p1, pose_p2, start_time,
+    sets_to_win=3,
 ):
     """Assemble a PredictionDataPacket from current pipeline state."""
     timestamp_sec = frame_idx / fps if fps > 0 else 0.0
@@ -171,6 +172,7 @@ def build_packet(
         player2_score=scores.get('player2'),
         player1_sets=rounds.get('player1', 0),
         player2_sets=rounds.get('player2', 0),
+        sets_to_win=sets_to_win,
         score_reliable=not (obscured.get('player1', False) or obscured.get('player2', False)),
     )
 

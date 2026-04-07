@@ -1,16 +1,16 @@
 {
-  "w_cv": 0.5714,
-  "w_profile": 0.4286,
+  "w_cv": 0.6364,
+  "w_profile": 0.3636,
   "cv_accuracy": 1.0,
-  "pr_accuracy": 0.75,
-  "n_matches_trained": 4,
-  "n_matches_total": 4,
+  "pr_accuracy": 0.5714285714285714,
+  "n_matches_trained": 7,
+  "n_matches_total": 7,
   "matches": [
     {
       "match_id": 0,
       "player1_name": "LEBRUN Felix",
       "player2_name": "MOREGARD Truls",
-      "cv_prob": 0.9955,
+      "cv_prob": 0.9855,
       "profile_prob": 0.6561,
       "label": 1,
       "profile_found": true
@@ -19,7 +19,7 @@
       "match_id": 1,
       "player1_name": "CALDERANO Hugo",
       "player2_name": "WANG Chuqin",
-      "cv_prob": 0.9977,
+      "cv_prob": 0.9963,
       "profile_prob": 0.3021,
       "label": 1,
       "profile_found": true
@@ -28,7 +28,7 @@
       "match_id": 2,
       "player1_name": "HARIMOTO Tomokazu",
       "player2_name": "CALDERANO Hugo",
-      "cv_prob": 0.0074,
+      "cv_prob": 0.0037,
       "profile_prob": 0.391,
       "label": 0,
       "profile_found": true
@@ -37,8 +37,35 @@
       "match_id": 3,
       "player1_name": "WANG Chuqin",
       "player2_name": "HARIMOTO Tomokazu",
-      "cv_prob": 0.9968,
+      "cv_prob": 0.9945,
       "profile_prob": 0.7025,
+      "label": 1,
+      "profile_found": true
+    },
+    {
+      "match_id": 4,
+      "player1_name": "LIN Shidong",
+      "player2_name": "HARIMOTO Tomokazu",
+      "cv_prob": 0.003,
+      "profile_prob": 0.5657,
+      "label": 0,
+      "profile_found": true
+    },
+    {
+      "match_id": 5,
+      "player1_name": "MOREGARD Truls",
+      "player2_name": "WANG Chuqin",
+      "cv_prob": 0.0013,
+      "profile_prob": 0.0811,
+      "label": 0,
+      "profile_found": true
+    },
+    {
+      "match_id": 6,
+      "player1_name": "CALDERANO Hugo",
+      "player2_name": "MOREGARD Truls",
+      "cv_prob": 0.9945,
+      "profile_prob": 0.3323,
       "label": 1,
       "profile_found": true
     }

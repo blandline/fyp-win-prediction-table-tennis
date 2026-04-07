@@ -58,6 +58,7 @@ class ScoreState:
     player2_score: Optional[int] = None
     player1_sets: int = 0
     player2_sets: int = 0
+    sets_to_win: int = 3
     score_reliable: bool = True                # False when OCR is obscured
 
 

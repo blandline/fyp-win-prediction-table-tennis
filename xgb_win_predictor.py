@@ -233,11 +233,17 @@ class XGBoostWinPredictor(WinPredictionModel):
         for k in history_keys:
             cumulative[f"{k}_last3"] = _safe_mean([r[k] for r in last3])
 
-        # Score features
+        # Score features — incorporate set advantage into score_diff so the
+        # model sees set leads as a large score advantage.  Each set lead is
+        # worth ~11 points (a full set) so the model treats being a set up
+        # similarly to a dominant point lead.
         p1_score = packet.score.player1_score or 0
         p2_score = packet.score.player2_score or 0
-        cumulative["score_diff"] = float(p1_score - p2_score)
-        cumulative["total_points"] = float(p1_score + p2_score)
+        p1_sets = packet.score.player1_sets
+        p2_sets = packet.score.player2_sets
+        set_diff = p1_sets - p2_sets
+        cumulative["score_diff"] = float(p1_score - p2_score) + set_diff * 11.0
+        cumulative["total_points"] = float(p1_score + p2_score) + (p1_sets + p2_sets) * 11.0
         cumulative["rally_number"] = float(n)
 
         row = [cumulative[k] for k in _FEATURE_NAMES]

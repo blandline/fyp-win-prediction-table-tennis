@@ -259,6 +259,7 @@ def collect(
     table_color="blue",
     auto_table_track=False,
     camera_index=None,
+    sets_to_win=3,
 ):
     """Main data collection loop."""
     # ------------------------------------------------------------------
@@ -552,6 +553,9 @@ def collect(
             if paused:
                 if last_displayed_frame is not None:
                     display_frame = last_displayed_frame.copy()
+                    score_detector.draw_scores(display_frame, rois, player_names=player_names)
+                    if prediction_model is not None:
+                        draw_prediction_overlay(display_frame, last_prediction, player_names=player_names)
                     _draw_scene_overlay(display_frame, scene_gate, skipped_frames)
                     _draw_rally_overlay(display_frame, rally_aggregator)
                     stats.draw(display_frame, frame_idx, total_frames, paused, playback_speed)
@@ -590,6 +594,9 @@ def collect(
             # ---- Scene gate: skip inference if active ----
             if not scene_gate.should_process:
                 skipped_frames += 1
+                score_detector.draw_scores(frame, rois, player_names=player_names)
+                if prediction_model is not None:
+                    draw_prediction_overlay(frame, last_prediction, player_names=player_names)
                 _draw_scene_overlay(frame, scene_gate, skipped_frames)
                 _draw_rally_overlay(frame, rally_aggregator)
                 stats.draw(frame, frame_idx, total_frames, paused, playback_speed)
@@ -692,6 +699,7 @@ def collect(
                 packet = build_packet(
                     frame_idx, fps, ball_tracker, tracks, score_detector,
                     rally_aggregator, pose_p1_latest, pose_p2_latest, start_time,
+                    sets_to_win=sets_to_win,
                 )
                 if (
                     current_stable_pred[0] is not None
@@ -896,6 +904,7 @@ Keyboard controls (OpenCV window):
                 ittf_name1=ittf1,
                 ittf_name2=ittf2,
                 player_names=player_names,
+                sets_to_win=args.sets_to_win,
             )
         else:
             pred_model = load_prediction_model(args.prediction_model)
@@ -921,4 +930,5 @@ Keyboard controls (OpenCV window):
         camera_index=args.camera,
         table_color=args.table_color,
         auto_table_track=args.auto_table_track,
+        sets_to_win=args.sets_to_win,
     )
