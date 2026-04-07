@@ -42,7 +42,7 @@ This repository is a full-stack table tennis analysis system built around YOLO-b
 ## 2. Project Structure
 
 ```
-dataset_prep/
+fyp-win-prediction-table-tennis/
 ├── broadcast_pipeline.py        # Broadcast pipeline with automatic scene detection
 ├── broadcast_data_collector.py  # Broadcast data collector with manual scene gate
 ├── broadcast_app_ui.py          # Streamlit UI that launches the collector
@@ -88,7 +88,7 @@ dataset_prep/
 
 ```bash
 git clone <repo-url>
-cd dataset_prep
+cd <repo>
 ```
 
 **2. Create and activate a virtual environment**
@@ -133,7 +133,7 @@ git clone https://github.com/abewley/sort.git sort
 After cloning, the directory structure should be:
 
 ```
-dataset_prep/
+fyp-win-prediction-table-tennis/
 └── sort/
     ├── sort.py
     └── ...
@@ -143,23 +143,9 @@ dataset_prep/
 
 ## 4. Model Weights Setup
 
-Several trained model weight files are required to run the pipelines. These files are excluded from the repository by `.gitignore` (all `*.pt` files and the `runs/` directory are ignored). Place the provided weights at the exact paths listed below so the scripts can find them without any extra configuration.
+Several trained model weight files are required to run the pipelines. These files are excluded from the repository by `.gitignore` (all `*.pt` files and the `runs/` directory are ignored). Place the provided weights in the repo so the scripts can find them without any extra configuration.
 
-### Required directory structure
 
-Create the following directories before placing the weights:
-
-```bash
-# Windows (PowerShell)
-New-Item -ItemType Directory -Force -Path "runs\detect\runs\ball_detector\weights"
-New-Item -ItemType Directory -Force -Path "runs\detect\runs\ball_detector_broadcast\weights"
-New-Item -ItemType Directory -Force -Path "runs\detect\runs\detect\digits_v2\weights"
-
-# macOS / Linux
-mkdir -p runs/detect/runs/ball_detector/weights
-mkdir -p runs/detect/runs/ball_detector_broadcast/weights
-mkdir -p runs/detect/runs/detect/digits_v2/weights
-```
 
 ### Weight files
 
